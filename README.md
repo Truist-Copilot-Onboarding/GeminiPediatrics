@@ -1,1 +1,1 @@
-# GeminiPediatrics
+# GeminiDental

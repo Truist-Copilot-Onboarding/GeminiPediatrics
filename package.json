@@ -1,0 +1,19 @@
+{
+    "name": "truist-registration-server",
+    "version": "1.0.0",
+    "description": "Node.js server for Truist Remote Work Registration Portal",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "axios": "^1.6.7",
+        "cors": "^2.8.5"
+    },
+    "engines": {
+        "node": ">=14.x"
+    },
+    "author": "",
+    "license": "ISC"
+}
