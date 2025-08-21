@@ -66,7 +66,7 @@ app.get('/', (_req, res) => {
   <div class="row"><div>Log</div>
     <div>
       <pre id="log"></pre>
-      <button id="copyLogs">Copy Logs</button> <!-- CHANGE: Add copy button -->
+      <button id="copyLogs">Copy Logs</button>
     </div>
   </div>
 </div>
@@ -81,7 +81,7 @@ app.get('/', (_req, res) => {
   const rttEl=document.getElementById('rtt');
   const sendBtn=document.getElementById('send');
   const reconnectBtn=document.getElementById('reconnect');
-  const copyLogsBtn=document.getElementById('copyLogs'); // CHANGE: Get copy button
+  const copyLogsBtn=document.getElementById('copyLogs');
   const input=document.getElementById('msg');
 
   const log=(m)=>{ 
@@ -93,14 +93,12 @@ app.get('/', (_req, res) => {
   const setSend=(on)=> sendBtn.disabled = !on;
   const mean=(a)=>a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
 
-  // CHANGE: Copy logs to clipboard
   copyLogsBtn.onclick = async () => {
     try {
       await navigator.clipboard.writeText(logEl.textContent);
       log('Logs copied to clipboard');
     } catch (e) {
       log('Copy failed: '+e.message);
-      // Fallback for non-secure contexts
       const textarea = document.createElement('textarea');
       textarea.value = logEl.textContent;
       document.body.appendChild(textarea);
@@ -121,12 +119,19 @@ app.get('/', (_req, res) => {
       log('OPEN '+url); 
       setSend(true); 
       reconnectAttempts = 0;
-      // CHANGE: Send application-level ping
-      const id = Math.random().toString(36).slice(2);
-      sent.set(id, performance.now());
-      ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
-      log('Client sent ping id='+id);
-      // CHANGE: Client heartbeat
+      // CHANGE: Send multiple pings to ensure activity
+      const id1 = Math.random().toString(36).slice(2);
+      sent.set(id1, performance.now());
+      ws.send(JSON.stringify({ type:'ping', id: id1, clientTs: Date.now() }));
+      log('Client sent initial ping id='+id1);
+      setTimeout(() => {
+        if (ws.readyState === ws.OPEN) {
+          const id2 = Math.random().toString(36).slice(2);
+          sent.set(id2, performance.now());
+          ws.send(JSON.stringify({ type:'ping', id: id2, clientTs: Date.now() }));
+          log('Client sent second ping id='+id2);
+        }
+      }, 100);
       const heartbeat = setInterval(() => {
         if (ws.readyState === ws.OPEN) {
           const id = Math.random().toString(36).slice(2);
@@ -144,11 +149,12 @@ app.get('/', (_req, res) => {
       setSend(false); 
       log('CLOSE code='+e.code+' reason="'+e.reason+'"');
       reconnectAttempts++;
-      const delay = Math.min(15000, 5000 + reconnectAttempts * 2000); // CHANGE: Exponential backoff
+      const delay = Math.min(20000, 5000 + reconnectAttempts * 3000); // CHANGE: Increased backoff
+      log('Reconnecting in '+delay+'ms');
       setTimeout(connect, delay);
     };
     ws.onmessage = (ev)=>{
-      log('MESSAGE received length='+ev.data.length);
+      log('MESSAGE received length='+ev.data.length+' content='+ev.data.slice(0, 200)); // CHANGE: Log message content
       let m=null; try{ m = JSON.parse(ev.data); } catch { return log('TEXT '+ev.data); }
       if (m.type==='welcome'){ log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
       if (m.type==='serverPing'){ log('serverPing '+m.serverTs); return; }
@@ -160,7 +166,6 @@ app.get('/', (_req, res) => {
       if (m.type==='error'){ log('ERROR '+m.message); return; }
       log('MSG '+JSON.stringify(m));
     };
-    // CHANGE: Removed ws.on('pong', ...)
   }
 
   sendBtn.onclick = ()=>{
@@ -206,7 +211,7 @@ app.get('/console', (_req, res) => {
 </header>
 <main>
   <pre id="out"></pre>
-  <button id="copyLogs">Copy Logs</button> <!-- CHANGE: Add copy button -->
+  <button id="copyLogs">Copy Logs</button>
 </main>
 <script>
   const out = document.getElementById('out');
@@ -214,7 +219,7 @@ app.get('/console', (_req, res) => {
   const es = new EventSource('/logs');
   es.onmessage = (e) => { out.textContent += e.data + "\\n"; out.scrollTop = out.scrollHeight; };
   es.onerror = () => { out.textContent += new Date().toISOString() + " [SSE] error/closed\\n"; };
-  copyLogsBtn.onclick = async () => { // CHANGE: Copy logs
+  copyLogsBtn.onclick = async () => {
     try {
       await navigator.clipboard.writeText(out.textContent);
       out.textContent += new Date().toISOString() + " Logs copied to clipboard\\n";
@@ -237,12 +242,13 @@ app.get('/logs', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Keep-Alive', 'timeout=30');
   res.flushHeaders?.();
   const send = (line) => res.write(`data: ${line}\n\n`);
   const onLine = (line) => send(line);
   bus.on('line', onLine);
   send(`${new Date().toISOString()} - [SSE] connected from ${req.ip || req.socket.remoteAddress}`);
-  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 15000);
+  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 10000);
   req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
 });
 
@@ -283,11 +289,12 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false,
+    perMessageDeflate: true, // CHANGE: Enable compression
     maxPayload: 1024 * 1024
   });
 
   wss.on('headers', (headers, req) => {
+    headers.push('Keep-Alive: timeout=30'); // CHANGE: Add keep-alive
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
@@ -295,8 +302,8 @@ function attachTunnelWSS(server) {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 5000); 
-      log('TUNNEL socket options set: noDelay=true, keepAlive=5s');
+      s.setKeepAlive(true, 3000); 
+      log('TUNNEL socket options set: noDelay=true, keepAlive=3s');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
     }
@@ -310,10 +317,17 @@ function attachTunnelWSS(server) {
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
     try {
+      log('TUNNEL socket state before send: readyState='+s.readyState); // CHANGE: Log socket state
       ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
       log('TUNNEL sent welcome');
-      ws.ping(); // CHANGE: Keep server ping for Heroku compatibility
+      ws.ping();
       log('TUNNEL sent initial ping');
+      setTimeout(() => {
+        if (ws.readyState === ws.OPEN) {
+          ws.ping();
+          log('TUNNEL sent second ping');
+        }
+      }, 100);
     } catch (e) {
       log('TUNNEL initial send error', e?.message || e);
     }
@@ -344,7 +358,7 @@ function attachTunnelWSS(server) {
         return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
       }
       if (m?.type === 'ping') {
-        log('TUNNEL received client ping id='+m.id); // CHANGE: Log client ping
+        log('TUNNEL received client ping id='+m.id);
         return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
       }
       if (m?.type === 'say') {
@@ -370,7 +384,7 @@ function attachRawSocketLogs(ws, label) {
   s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`));
   s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
   s.on('timeout', () => log(`${label} RAW timeout`));
-  s.on('data', (data) => log(`${label} RAW data length=${data.length}`));
+  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`)); // CHANGE: Log data content
 }
 
 function safeSend(ws, obj) { 
