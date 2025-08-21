@@ -63,7 +63,12 @@ app.get('/', (_req, res) => {
 </div>
 
 <div class="card">
-  <div class="row"><div>Log</div><div><pre id="log"></pre></div></div>
+  <div class="row"><div>Log</div>
+    <div>
+      <pre id="log"></pre>
+      <button id="copyLogs">Copy Logs</button> <!-- CHANGE: Add copy button -->
+    </div>
+  </div>
 </div>
 
 <script>
@@ -76,26 +81,58 @@ app.get('/', (_req, res) => {
   const rttEl=document.getElementById('rtt');
   const sendBtn=document.getElementById('send');
   const reconnectBtn=document.getElementById('reconnect');
+  const copyLogsBtn=document.getElementById('copyLogs'); // CHANGE: Get copy button
   const input=document.getElementById('msg');
 
-  const log=(m)=>{ const s=new Date().toISOString()+' '+m; console.log(s); logEl.textContent += s+"\\n"; logEl.scrollTop = logEl.scrollHeight; };
+  const log=(m)=>{ 
+    const s=new Date().toISOString()+' '+m; 
+    console.log(s); 
+    logEl.textContent += s+"\\n"; 
+    logEl.scrollTop = logEl.scrollHeight; 
+  };
   const setSend=(on)=> sendBtn.disabled = !on;
   const mean=(a)=>a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
 
-  let ws, sent = new Map(), rtts=[];
+  // CHANGE: Copy logs to clipboard
+  copyLogsBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(logEl.textContent);
+      log('Logs copied to clipboard');
+    } catch (e) {
+      log('Copy failed: '+e.message);
+      // Fallback for non-secure contexts
+      const textarea = document.createElement('textarea');
+      textarea.value = logEl.textContent;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      log('Logs copied using fallback');
+    }
+  };
+
+  let ws, sent = new Map(), rtts=[], reconnectAttempts = 0;
 
   function connect(){
-    log('Attempting connection to '+url);
+    log('Attempting connection to '+url+' (attempt '+(reconnectAttempts+1)+')');
     ws = new WebSocket(url);
     ws.onopen = ()=>{ 
       status.innerHTML='<span class="ok">OPEN</span>'; 
       log('OPEN '+url); 
       setSend(true); 
-      try { ws.ping(); log('Client sent ping'); } catch(e) { log('Client ping error: '+e.message); }
+      reconnectAttempts = 0;
+      // CHANGE: Send application-level ping
+      const id = Math.random().toString(36).slice(2);
+      sent.set(id, performance.now());
+      ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
+      log('Client sent ping id='+id);
       // CHANGE: Client heartbeat
       const heartbeat = setInterval(() => {
         if (ws.readyState === ws.OPEN) {
-          try { ws.ping(); log('Client heartbeat ping'); } catch {}
+          const id = Math.random().toString(36).slice(2);
+          sent.set(id, performance.now());
+          ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
+          log('Client heartbeat ping id='+id);
         } else {
           clearInterval(heartbeat);
         }
@@ -106,22 +143,24 @@ app.get('/', (_req, res) => {
       status.innerHTML='<span class="bad">CLOSED</span> code='+e.code; 
       setSend(false); 
       log('CLOSE code='+e.code+' reason="'+e.reason+'"');
-      setTimeout(connect, 5000);
+      reconnectAttempts++;
+      const delay = Math.min(15000, 5000 + reconnectAttempts * 2000); // CHANGE: Exponential backoff
+      setTimeout(connect, delay);
     };
     ws.onmessage = (ev)=>{
+      log('MESSAGE received length='+ev.data.length);
       let m=null; try{ m = JSON.parse(ev.data); } catch { return log('TEXT '+ev.data); }
       if (m.type==='welcome'){ log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
       if (m.type==='serverPing'){ log('serverPing '+m.serverTs); return; }
       if (m.type==='pong'){
         const t0 = sent.get(m.id);
         if (t0){ const dt = performance.now()-t0; rtts.push(dt); if (rtts.length>20) rtts.shift(); rttEl.textContent = mean(rtts).toFixed(1)+' ms'; sent.delete(m.id); }
-        log('PONG id='+m.id+' serverT='+m.serverTs); return;
-      }
+        log('PONG id='+m.id+' serverT='+m.serverTs); return; }
       if (m.type==='say'){ log('SAY '+JSON.stringify(m)); return; }
       if (m.type==='error'){ log('ERROR '+m.message); return; }
       log('MSG '+JSON.stringify(m));
     };
-    ws.on('pong', () => { log('Client received pong'); });
+    // CHANGE: Removed ws.on('pong', ...)
   }
 
   sendBtn.onclick = ()=>{
@@ -167,12 +206,30 @@ app.get('/console', (_req, res) => {
 </header>
 <main>
   <pre id="out"></pre>
+  <button id="copyLogs">Copy Logs</button> <!-- CHANGE: Add copy button -->
 </main>
 <script>
   const out = document.getElementById('out');
+  const copyLogsBtn = document.getElementById('copyLogs');
   const es = new EventSource('/logs');
   es.onmessage = (e) => { out.textContent += e.data + "\\n"; out.scrollTop = out.scrollHeight; };
   es.onerror = () => { out.textContent += new Date().toISOString() + " [SSE] error/closed\\n"; };
+  copyLogsBtn.onclick = async () => { // CHANGE: Copy logs
+    try {
+      await navigator.clipboard.writeText(out.textContent);
+      out.textContent += new Date().toISOString() + " Logs copied to clipboard\\n";
+    } catch (e) {
+      out.textContent += new Date().toISOString() + " Copy failed: " + e.message + "\\n";
+      const textarea = document.createElement('textarea');
+      textarea.value = out.textContent;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      out.textContent += new Date().toISOString() + " Logs copied using fallback\\n";
+    }
+    out.scrollTop = out.scrollHeight;
+  };
 </script>`);
 });
 
@@ -252,11 +309,10 @@ function attachTunnelWSS(server) {
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-    // Send welcome and ping synchronously
     try {
       ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
       log('TUNNEL sent welcome');
-      ws.ping();
+      ws.ping(); // CHANGE: Keep server ping for Heroku compatibility
       log('TUNNEL sent initial ping');
     } catch (e) {
       log('TUNNEL initial send error', e?.message || e);
@@ -269,7 +325,6 @@ function attachTunnelWSS(server) {
       } catch {} 
     });
 
-    // CHANGE: Log incoming pongs
     ws.on('pong', () => {
       log('TUNNEL received pong');
     });
@@ -280,15 +335,16 @@ function attachTunnelWSS(server) {
         ws.ping(); 
         log('TUNNEL heartbeat ping sent');
       } catch {}
-    }, 2000); // CHANGE: Reduced to 2s
+    }, 2000);
 
     ws.on('message', (data, isBinary) => {
-      log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`); // CHANGE: Log message content
+      log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
       let m = null;
       try { m = JSON.parse(data.toString('utf8')); } catch {
         return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
       }
       if (m?.type === 'ping') {
+        log('TUNNEL received client ping id='+m.id); // CHANGE: Log client ping
         return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
       }
       if (m?.type === 'say') {
