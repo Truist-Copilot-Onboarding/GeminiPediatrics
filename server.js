@@ -63,12 +63,7 @@ app.get('/', (_req, res) => {
 </div>
 
 <div class="card">
-  <div class="row"><div>Log</div>
-    <div>
-      <pre id="log"></pre>
-      <button id="copyLogs">Copy Logs</button>
-    </div>
-  </div>
+  <div class="row"><div>Log</div><div><pre id="log"></pre></div></div>
 </div>
 
 <script>
@@ -81,99 +76,46 @@ app.get('/', (_req, res) => {
   const rttEl=document.getElementById('rtt');
   const sendBtn=document.getElementById('send');
   const reconnectBtn=document.getElementById('reconnect');
-  const copyLogsBtn=document.getElementById('copyLogs');
   const input=document.getElementById('msg');
 
-  const log=(m)=>{ 
-    const s=new Date().toISOString()+' '+m; 
-    console.log(s); 
-    logEl.textContent += s+"\\n"; 
-    logEl.scrollTop = logEl.scrollHeight; 
-  };
+  const log=(m)=>{ const s=new Date().toISOString()+' '+m; console.log(s); logEl.textContent += s+"\\n"; logEl.scrollTop = logEl.scrollHeight; };
   const setSend=(on)=> sendBtn.disabled = !on;
   const mean=(a)=>a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
 
-  copyLogsBtn.onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(logEl.textContent);
-      log('Logs copied to clipboard');
-    } catch (e) {
-      log('Copy failed: '+e.message);
-      const textarea = document.createElement('textarea');
-      textarea.value = logEl.textContent;
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-      log('Logs copied using fallback');
-    }
-  };
-
-  let ws, sent = new Map(), rtts=[], reconnectAttempts = 0;
+  let ws, sent = new Map(), rtts=[];
 
   function connect(){
-    log('Attempting connection to '+url+' (attempt '+(reconnectAttempts+1)+')');
+    log('Attempting connection to '+url);
     ws = new WebSocket(url);
     ws.onopen = ()=>{ 
       status.innerHTML='<span class="ok">OPEN</span>'; 
       log('OPEN '+url); 
       setSend(true); 
-      reconnectAttempts = 0;
-      // CHANGE: Send multiple pings
-      try {
-        const id1 = Math.random().toString(36).slice(2);
-        sent.set(id1, performance.now());
-        ws.send(JSON.stringify({ type:'ping', id: id1, clientTs: Date.now() }));
-        log('Client sent initial ping id='+id1);
-        setTimeout(() => {
-          if (ws.readyState === ws.OPEN) {
-            const id2 = Math.random().toString(36).slice(2);
-            sent.set(id2, performance.now());
-            ws.send(JSON.stringify({ type:'ping', id: id2, clientTs: Date.now() }));
-            log('Client sent second ping id='+id2);
-          }
-        }, 50);
-      } catch (e) {
-        log('Client send error: '+e.message); // CHANGE: Log send errors
-      }
-      const heartbeat = setInterval(() => {
-        if (ws.readyState === ws.OPEN) {
-          try {
-            const id = Math.random().toString(36).slice(2);
-            sent.set(id, performance.now());
-            ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
-            log('Client heartbeat ping id='+id);
-          } catch (e) {
-            log('Client heartbeat error: '+e.message);
-          }
-        } else {
-          clearInterval(heartbeat);
-        }
-      }, 1000); // CHANGE: Reduced to 1s
+      // CHANGE: Send client ping immediately
+      try { ws.ping(); log('Client sent ping'); } catch(e) { log('Client ping error: '+e.message); }
     };
     ws.onerror = (e)=>{ log('ERROR (browser hides details)'); };
     ws.onclose = (e)=>{
       status.innerHTML='<span class="bad">CLOSED</span> code='+e.code; 
       setSend(false); 
       log('CLOSE code='+e.code+' reason="'+e.reason+'"');
-      reconnectAttempts++;
-      const delay = Math.min(20000, 5000 + reconnectAttempts * 3000);
-      log('Reconnecting in '+delay+'ms');
-      setTimeout(connect, delay);
+      setTimeout(connect, 5000); // CHANGE: Increased reconnect delay to 5s
     };
     ws.onmessage = (ev)=>{
-      log('MESSAGE received length='+ev.data.length+' content='+ev.data.slice(0, 200));
       let m=null; try{ m = JSON.parse(ev.data); } catch { return log('TEXT '+ev.data); }
       if (m.type==='welcome'){ log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
       if (m.type==='serverPing'){ log('serverPing '+m.serverTs); return; }
       if (m.type==='pong'){
         const t0 = sent.get(m.id);
         if (t0){ const dt = performance.now()-t0; rtts.push(dt); if (rtts.length>20) rtts.shift(); rttEl.textContent = mean(rtts).toFixed(1)+' ms'; sent.delete(m.id); }
-        log('PONG id='+m.id+' serverT='+m.serverTs); return; }
+        log('PONG id='+m.id+' serverT='+m.serverTs); return;
+      }
       if (m.type==='say'){ log('SAY '+JSON.stringify(m)); return; }
       if (m.type==='error'){ log('ERROR '+m.message); return; }
       log('MSG '+JSON.stringify(m));
     };
+    // CHANGE: Handle pong from server
+    ws.on('pong', () => { log('Client received pong'); });
   }
 
   sendBtn.onclick = ()=>{
@@ -182,19 +124,11 @@ app.get('/', (_req, res) => {
     if (text.toLowerCase()==='ping'){
       const id = Math.random().toString(36).slice(2);
       sent.set(id, performance.now());
-      try {
-        ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
-        log('PING id='+id);
-      } catch (e) {
-        log('Send ping error: '+e.message);
-      }
+      ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
+      log('PING id='+id);
     } else {
-      try {
-        ws.send(JSON.stringify({ type:'say', text, clientTs: Date.now() }));
-        log('SEND text='+text);
-      } catch (e) {
-        log('Send text error: '+e.message);
-      }
+      ws.send(JSON.stringify({ type:'say', text, clientTs: Date.now() }));
+      log('SEND text='+text);
     }
     input.value='';
   };
@@ -227,30 +161,12 @@ app.get('/console', (_req, res) => {
 </header>
 <main>
   <pre id="out"></pre>
-  <button id="copyLogs">Copy Logs</button>
 </main>
 <script>
   const out = document.getElementById('out');
-  const copyLogsBtn = document.getElementById('copyLogs');
   const es = new EventSource('/logs');
   es.onmessage = (e) => { out.textContent += e.data + "\\n"; out.scrollTop = out.scrollHeight; };
   es.onerror = () => { out.textContent += new Date().toISOString() + " [SSE] error/closed\\n"; };
-  copyLogsBtn.onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(out.textContent);
-      out.textContent += new Date().toISOString() + " Logs copied to clipboard\\n";
-    } catch (e) {
-      out.textContent += new Date().toISOString() + " Copy failed: " + e.message + "\\n";
-      const textarea = document.createElement('textarea');
-      textarea.value = out.textContent;
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-      out.textContent += new Date().toISOString() + " Logs copied using fallback\\n";
-    }
-    out.scrollTop = out.scrollHeight;
-  };
 </script>`);
 });
 
@@ -258,13 +174,12 @@ app.get('/logs', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Keep-Alive', 'timeout=30');
   res.flushHeaders?.();
   const send = (line) => res.write(`data: ${line}\n\n`);
   const onLine = (line) => send(line);
   bus.on('line', onLine);
   send(`${new Date().toISOString()} - [SSE] connected from ${req.ip || req.socket.remoteAddress}`);
-  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 10000);
+  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 15000);
   req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
 });
 
@@ -278,7 +193,7 @@ server.on('clientError', (err, socket) => {
 });
 
 server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`); // CHANGE: Added extensions
 });
 
 // Attach WS endpoints
@@ -305,21 +220,37 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false, // CHANGE: Disable compression
-    maxPayload: 1024 * 1024
+    perMessageDeflate: false,
+    maxPayload: 1024 * 1024 // CHANGE: Reduced to 1MB to avoid proxy issues
+  });
+
+  // CHANGE: Explicit handshake control
+  server.on('upgrade', (req, socket, head) => {
+    if (req.url !== '/ws-tunnel') return;
+    log('TUNNEL upgrade request received');
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      // Add custom headers to handshake response
+      socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
+                   'Upgrade: websocket\r\n' +
+                   'Connection: Upgrade\r\n' +
+                   `Sec-WebSocket-Accept: ${require('ws').createWebSocketStream(ws).acceptKey(req.headers['sec-websocket-key'])}\r\n` +
+                   'Sec-WebSocket-Protocol: tunnel\r\n' + // CHANGE: Add protocol
+                   '\r\n');
+      wss.emit('connection', ws, req);
+    });
   });
 
   wss.on('headers', (headers, req) => {
-    headers.push('Keep-Alive: timeout=30');
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
   wss.on('connection', (ws, req) => {
+    // ---- Raw socket hygiene
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 2000); // CHANGE: Reduced to 2s
-      log('TUNNEL socket options set: noDelay=true, keepAlive=2s');
+      s.setKeepAlive(true, 5000); 
+      log('TUNNEL socket options set: noDelay=true, keepAlive=5s');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
     }
@@ -332,23 +263,23 @@ function attachTunnelWSS(server) {
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
+    // ---- Send welcome message first
     try {
-      log('TUNNEL socket state before send: readyState='+s.readyState);
       ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
       log('TUNNEL sent welcome');
-      // CHANGE: Send simple text frame first
-      ws.send('welcome');
-      log('TUNNEL sent text welcome');
-      setTimeout(() => {
-        if (ws.readyState === ws.OPEN) {
-          ws.send(JSON.stringify({ type: 'ping', id: 'server-init', serverTs: Date.now() }));
-          log('TUNNEL sent server ping');
-        }
-      }, 50);
     } catch (e) {
-      log('TUNNEL initial send error', e?.message || e);
+      log('TUNNEL welcome error', e?.message || e);
     }
 
+    // ---- Send immediate ping
+    try { 
+      ws.ping(); 
+      log('TUNNEL sent initial ping');
+    } catch (e) {
+      log('TUNNEL initial ping error', e?.message || e);
+    }
+
+    // ---- If client pings the server, answer
     ws.on('ping', () => { 
       try { 
         ws.pong(); 
@@ -356,22 +287,23 @@ function attachTunnelWSS(server) {
       } catch {} 
     });
 
-    ws.on('pong', () => {
-      log('TUNNEL received pong');
-    });
-
+    // ---- Heartbeat
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
-    }, 1000); // CHANGE: Reduced to 1s
+      try { 
+        ws.ping(); 
+        log('TUNNEL heartbeat ping sent');
+      } catch {}
+    }, 3000); // CHANGE: Reduced to 3s
 
+    // ---- Handle app messages
     ws.on('message', (data, isBinary) => {
-      log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
+      log(`TUNNEL message received isBinary=${isBinary} length=${data.length}`); // CHANGE: Log message details
       let m = null;
       try { m = JSON.parse(data.toString('utf8')); } catch {
         return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
       }
       if (m?.type === 'ping') {
-        log('TUNNEL received client ping id='+m.id);
         return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
       }
       if (m?.type === 'say') {
@@ -384,7 +316,7 @@ function attachTunnelWSS(server) {
     ws.on('close', (code, reason) => {
       clearInterval(appBeat);
       const r = reason && reason.toString ? reason.toString() : '';
-      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`);
+      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`); // CHANGE: Log buffer length
     });
   });
 }
@@ -397,15 +329,12 @@ function attachRawSocketLogs(ws, label) {
   s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`));
   s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
   s.on('timeout', () => log(`${label} RAW timeout`));
-  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`));
+  s.on('data', (data) => log(`${label} RAW data length=${data.length}`)); // CHANGE: Log raw data events
 }
 
 function safeSend(ws, obj) { 
   try { 
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify(obj));
-      log('safeSend success: '+JSON.stringify(obj).slice(0, 200));
-    }
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); 
   } catch (e) { 
     log('safeSend error', e?.message || e); 
   } 
