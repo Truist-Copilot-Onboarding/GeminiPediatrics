@@ -1,4 +1,4 @@
-// server.js — Heroku-compatible WS tunnel + live console (CommonJS)
+// server.js — Heroku-compatible WS tunnel + live console + deep socket diagnostics (CommonJS)
 
 const http = require('http');
 const express = require('express');
@@ -10,9 +10,6 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
 };
 
-// ──────────────────────────────────────────────
-// Central log bus → broadcasts to SSE clients
-// ──────────────────────────────────────────────
 const bus = new EventEmitter();
 function log(...a) {
   const line = `${new Date().toISOString()} - ${a.map(v => (typeof v === 'string' ? v : JSON.stringify(v))).join(' ')}`;
@@ -20,18 +17,17 @@ function log(...a) {
   bus.emit('line', line);
 }
 
+// Catch hidden crashes
+process.on('uncaughtException', (e) => log('UNCAUGHT', e?.stack || e?.message || String(e)));
+process.on('unhandledRejection', (e) => log('UNHANDLED_REJECTION', e?.stack || e?.message || String(e)));
+
 const app = express();
 app.set('trust proxy', true);
-
-// Small header
 app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
 
-// Health
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-// ──────────────────────────────────────────────
-// Root: WSS tester page
-// ──────────────────────────────────────────────
+// ────────────────── Root tester ──────────────────
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8">
@@ -48,7 +44,7 @@ app.get('/', (_req, res) => {
   a{color:inherit}
 </style>
 <h1>WebSocket Tunnel (Heroku)</h1>
-<p class="muted">Served over HTTPS; client connects to <code>wss://HOST/ws-tunnel</code>. Echo also at <code>/ws-echo</code>. See <a href="/console" target="_blank">/console</a> for live server logs.</p>
+<p class="muted">Served over HTTPS; connects to <code>wss://HOST/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live server logs at <a href="/console" target="_blank">/console</a>.</p>
 
 <div class="row"><div>Endpoint</div><div><code id="ep">…</code></div></div>
 <div class="row"><div>Status</div><div id="status">Connecting…</div></div>
@@ -124,10 +120,7 @@ app.get('/', (_req, res) => {
 </script>`);
 });
 
-// ──────────────────────────────────────────────
-// /console → Live server log viewer (SSE)
-// /logs    → SSE stream (text lines)
-// ──────────────────────────────────────────────
+// ───────────── /console (SSE) ─────────────
 app.get('/console', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8">
@@ -149,13 +142,8 @@ app.get('/console', (_req, res) => {
 <script>
   const out = document.getElementById('out');
   const es = new EventSource('/logs');
-  es.onmessage = (e) => {
-    out.textContent += e.data + "\\n";
-    out.scrollTop = out.scrollHeight;
-  };
-  es.onerror = () => {
-    out.textContent += new Date().toISOString() + " [SSE] connection error / closed\\n";
-  };
+  es.onmessage = (e) => { out.textContent += e.data + "\\n"; out.scrollTop = out.scrollHeight; };
+  es.onerror = () => { out.textContent += new Date().toISOString() + " [SSE] error/closed\\n"; };
 </script>`);
 });
 
@@ -167,39 +155,33 @@ app.get('/logs', (req, res) => {
   const send = (line) => res.write(`data: ${line}\n\n`);
   const onLine = (line) => send(line);
   bus.on('line', onLine);
-
-  // Send a hello and keepalive every 25s (avoid idle proxies)
   send(`${new Date().toISOString()} - [SSE] connected from ${req.ip || req.socket.remoteAddress}`);
   const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 25000);
-
   req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
 });
 
-// ──────────────────────────────────────────────
-// Single HTTP server + WS upgrades (Heroku style)
-// ──────────────────────────────────────────────
+// ─────────── HTTP server + WS on same port ───────────
 const server = http.createServer(app);
 
-// Loud upgrade logs to prove the Upgrade reaches the dyno
+server.on('clientError', (err, socket) => {
+  log('HTTP clientError', err?.message || err);
+  try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
+});
+
 server.on('upgrade', (req, _sock) => {
   log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'}`);
 });
 
-// Attach WS endpoints
 attachTunnelWSS(server);
 attachEchoWSS(server);
 
-// Listen
-server.listen(CONFIG.PORT, '0.0.0.0', () => {
-  log(`web listening on :${CONFIG.PORT}`);
-});
+server.listen(CONFIG.PORT, '0.0.0.0', () => log(`web listening on :${CONFIG.PORT}`));
 
-// ──────────────────────────────────────────────
-// WS handlers
-// ──────────────────────────────────────────────
+// ─────────── WS endpoints ───────────
 function attachEchoWSS(server) {
   const wss = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
   wss.on('connection', (ws, req) => {
+    attachRawSocketLogs(ws, 'ECHO');
     const ip = req.socket.remoteAddress;
     const origin = req.headers.origin || '(null)';
     log(`ECHO connected ip=${ip} origin=${origin}`);
@@ -211,35 +193,41 @@ function attachEchoWSS(server) {
 function attachTunnelWSS(server) {
   const wss = new WebSocketServer({ server, path: '/ws-tunnel', perMessageDeflate: false });
 
+  // Optional: peek at negotiated response headers
+  wss.on('headers', (headers, req) => {
+    log('HEADERS ws-tunnel', JSON.stringify(headers));
+  });
+
   wss.on('connection', (ws, req) => {
+    attachRawSocketLogs(ws, 'TUNNEL');
     const ip = req.socket.remoteAddress;
     const origin = req.headers.origin || '(null)';
     const ua = req.headers['user-agent'] || '(ua?)';
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-    // Welcome text frame
-    safeSend(ws, { type: 'welcome', clientId, serverTs: Date.now() });
+    // Be conservative: avoid sending in the same tick as the handshake
+    setTimeout(() => safeSend(ws, { type: 'welcome', clientId, serverTs: Date.now() }), 150);
 
-    // Control keepalive (browser auto-pongs); keep < Heroku idle (~55s)
-    const ctrlPing = setInterval(() => {
+    // Control keepalive (start after a moment)
+    const ctrlPing = setTimeout(() => setInterval(() => {
       if (ws.readyState === ws.OPEN) { try { ws.ping(); } catch {} }
-    }, 25000);
+    }, 25000), 2000);
 
-    // App heartbeat (visible to client)
-    const appBeat = setInterval(() => {
+    // App heartbeat
+    const appBeat = setTimeout(() => setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
-    }, 15000);
+    }, 15000), 2000);
 
     ws.on('message', (data) => {
       let m = null;
       try { m = JSON.parse(data.toString('utf8')); } catch {
         return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
       }
-      if (m && m.type === 'ping') {
+      if (m?.type === 'ping') {
         return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
       }
-      if (m && m.type === 'say') {
+      if (m?.type === 'say') {
         return safeSend(ws, { type: 'say', echo: m.text ?? '', serverTs: Date.now() });
       }
       safeSend(ws, { type: 'error', message: 'Unsupported message type' });
@@ -247,11 +235,21 @@ function attachTunnelWSS(server) {
 
     ws.on('error', (err) => { log('TUNNEL error:', err?.message || err); });
     ws.on('close', (code, reason) => {
-      clearInterval(ctrlPing); clearInterval(appBeat);
+      if (typeof ctrlPing === 'number') clearTimeout(ctrlPing);
+      if (typeof appBeat === 'number') clearTimeout(appBeat);
       const r = reason && reason.toString ? reason.toString() : '';
       log(`TUNNEL closed id=${clientId} code=${code} reason="${r}"`);
     });
   });
+}
+
+function attachRawSocketLogs(ws, label) {
+  const s = ws._socket;
+  try { s.setNoDelay(true); } catch {}
+  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr}`));
+  s.on('end', () => log(`${label} RAW end`));
+  s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
+  s.on('timeout', () => log(`${label} RAW timeout`));
 }
 
 function safeSend(ws, obj) { try { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); } catch {} }
