@@ -10,6 +10,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
 };
 
+// Central log bus → broadcasts to SSE clients
 const bus = new EventEmitter();
 function log(...a) {
   const line = `${new Date().toISOString()} - ${a.map(v => (typeof v === 'string' ? v : JSON.stringify(v))).join(' ')}`;
@@ -25,6 +26,7 @@ const app = express();
 app.set('trust proxy', true);
 app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
 
+// Health
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
 // ────────────────── Root tester ──────────────────
@@ -163,6 +165,7 @@ app.get('/logs', (req, res) => {
 // ─────────── HTTP server + WS on same port ───────────
 const server = http.createServer(app);
 
+// Extra diagnostics
 server.on('clientError', (err, socket) => {
   log('HTTP clientError', err?.message || err);
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
@@ -172,9 +175,11 @@ server.on('upgrade', (req, _sock) => {
   log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'}`);
 });
 
+// Attach WS endpoints
 attachTunnelWSS(server);
 attachEchoWSS(server);
 
+// Listen
 server.listen(CONFIG.PORT, '0.0.0.0', () => log(`web listening on :${CONFIG.PORT}`));
 
 // ─────────── WS endpoints ───────────
@@ -191,34 +196,47 @@ function attachEchoWSS(server) {
 }
 
 function attachTunnelWSS(server) {
-  const wss = new WebSocketServer({ server, path: '/ws-tunnel', perMessageDeflate: false });
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws-tunnel',
+    perMessageDeflate: false,            // safe default for intermediaries
+    maxPayload: 100 * 1024 * 1024
+  });
 
-  // Optional: peek at negotiated response headers
+  // See negotiated response headers
   wss.on('headers', (headers, req) => {
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
   wss.on('connection', (ws, req) => {
+    // ---- Raw socket hygiene immediately on connect
+    const s = ws._socket;
+    try { s.setNoDelay(true); } catch {}
+    try { s.setKeepAlive(true, 10000); } catch {} // 10s initial probe
+
     attachRawSocketLogs(ws, 'TUNNEL');
+
     const ip = req.socket.remoteAddress;
     const origin = req.headers.origin || '(null)';
     const ua = req.headers['user-agent'] || '(ua?)';
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-    // Be conservative: avoid sending in the same tick as the handshake
-    setTimeout(() => safeSend(ws, { type: 'welcome', clientId, serverTs: Date.now() }), 150);
+    // ---- Send something immediately (some intermediaries close if idle)
+    safeSend(ws, { type: 'welcome', clientId, serverTs: Date.now() });
 
-    // Control keepalive (start after a moment)
-    const ctrlPing = setTimeout(() => setInterval(() => {
-      if (ws.readyState === ws.OPEN) { try { ws.ping(); } catch {} }
-    }, 25000), 2000);
+    // Also send a tiny "tick" frame to prove traffic exists right away
+    try { if (ws.readyState === ws.OPEN) ws.send(' '); } catch {}
 
-    // App heartbeat
-    const appBeat = setTimeout(() => setInterval(() => {
+    // ---- If client pings the server, answer (defensive)
+    ws.on('ping', () => { try { ws.pong(); } catch {} });
+
+    // ---- Visible heartbeat (keep under typical idle timeouts)
+    const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
-    }, 15000), 2000);
+    }, 15000);
 
+    // ---- Handle app messages
     ws.on('message', (data) => {
       let m = null;
       try { m = JSON.parse(data.toString('utf8')); } catch {
@@ -235,8 +253,7 @@ function attachTunnelWSS(server) {
 
     ws.on('error', (err) => { log('TUNNEL error:', err?.message || err); });
     ws.on('close', (code, reason) => {
-      if (typeof ctrlPing === 'number') clearTimeout(ctrlPing);
-      if (typeof appBeat === 'number') clearTimeout(appBeat);
+      clearInterval(appBeat);
       const r = reason && reason.toString ? reason.toString() : '';
       log(`TUNNEL closed id=${clientId} code=${code} reason="${r}"`);
     });
@@ -245,6 +262,7 @@ function attachTunnelWSS(server) {
 
 function attachRawSocketLogs(ws, label) {
   const s = ws._socket;
+  if (!s) return;
   try { s.setNoDelay(true); } catch {}
   s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr}`));
   s.on('end', () => log(`${label} RAW end`));
