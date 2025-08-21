@@ -13,7 +13,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 16 * 1024, // CHANGE: Reduced to 16 KiB
+  CHUNK_SIZE: 8 * 1024, // CHANGE: Reduced to 8 KiB
 };
 
 // ──────────────────────────────────────────────
@@ -208,7 +208,17 @@ app.get('/', (_req, res) => {
       log('MESSAGE received length='+ev.data.length+' content='+ev.data.slice(0, 200)); // CHANGE: Log message content
       let m=null; try{ m = JSON.parse(ev.data); } catch { return log('TEXT '+String(ev.data).slice(0,200)); }
 
-      if (m.type==='welcome'){ log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
+      if (m.type==='welcome'){ 
+        log('WELCOME id='+m.clientId+' serverT='+m.serverTs); 
+        // CHANGE: Send ready after welcome
+        try {
+          const id = Math.random().toString(36).slice(2);
+          sent.set(id, performance.now());
+          ws.send(JSON.stringify({ type:'ready', id, clientTs: Date.now() }));
+          log('Client sent ready id='+id);
+        } catch (e) { log('Client ready error: '+e.message); }
+        return; 
+      }
       if (m.type==='serverPing'){ log('serverPing '+m.serverTs); return; }
       if (m.type==='error'){ log('ERROR '+m.message); return; }
 
@@ -234,13 +244,6 @@ app.get('/', (_req, res) => {
         pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
         pdfProg.max = rx.size || 100;
         log('FILE META '+JSON.stringify(m));
-        // CHANGE: Confirm readiness
-        try {
-          const id = Math.random().toString(36).slice(2);
-          sent.set(id, performance.now());
-          ws.send(JSON.stringify({ type:'ready', id, clientTs: Date.now() }));
-          log('Client sent ready id='+id);
-        } catch (e) { log('Client ready error: '+e.message); }
         return;
       }
       if (m.type==='fileChunk' && rx){
@@ -398,12 +401,12 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false, // CHANGE: Keep disabled
+    perMessageDeflate: false,
     maxPayload: 100 * 1024 * 1024
   });
 
   wss.on('headers', (headers, req) => {
-    headers.push('Keep-Alive: timeout=30'); // CHANGE: Add keep-alive
+    headers.push('Keep-Alive: timeout=30');
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
@@ -411,8 +414,8 @@ function attachTunnelWSS(server) {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 3000); 
-      log('TUNNEL socket options set: noDelay=true, keepAlive=3s');
+      s.setKeepAlive(true, 2000); // CHANGE: Reduced to 2s
+      log('TUNNEL socket options set: noDelay=true, keepAlive=2s');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
     }
@@ -443,7 +446,7 @@ function attachTunnelWSS(server) {
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
       log('TUNNEL sent heartbeat ping');
-    }, 3000);
+    }, 2000); // CHANGE: 2s heartbeat
 
     // Handle messages
     ws.on('message', (data, isBinary) => {
@@ -459,7 +462,6 @@ function attachTunnelWSS(server) {
       if (m?.type === 'ready') {
         clientReady = true;
         log('TUNNEL client ready id='+m.id);
-        // CHANGE: Start file transfer only after ready
         if (PDF_BUFFER && ws.readyState === ws.OPEN) {
           try { streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE); }
           catch (e) { safeSend(ws, { type:'error', message: 'PDF stream failed: '+(e?.message||e) }); }
@@ -509,8 +511,8 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
       log('TUNNEL file chunk error: '+e.message);
       throw e;
     }
-    // CHANGE: Add 50ms delay between chunks
-    await new Promise(resolve => setTimeout(resolve, 50));
+    // CHANGE: Add 100ms delay between chunks
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
   safeSend(ws, { type:'fileEnd', name, ok:true });
   log('TUNNEL sent fileEnd');
