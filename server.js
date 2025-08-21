@@ -1,15 +1,11 @@
-// Heroku-compatible WebSocket tunnel tester
-// - Listens on process.env.PORT (single port required by Heroku)
-// - TLS is terminated by Heroku; use ws:// or wss:// based on page protocol
-// - Sends welcome, app-level serverPing, and responds to client {type:'ping'} with {type:'pong'}
-// - Idle keepalive < 55s (Heroku router idle WS timeout) to keep connections alive
+// server.js — Heroku-compatible WebSocket tunnel tester (CommonJS)
 
-import http from 'http';
-import express from 'express';
-import { WebSocketServer } from 'ws';
+const http = require('http');
+const express = require('express');
+const { WebSocketServer } = require('ws');
 
 const CONFIG = {
-  PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
+  PORT: process.env.PORT ? Number(process.env.PORT) : 80,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
 };
 
@@ -18,14 +14,20 @@ const log = (...a) => console.log(new Date().toISOString(), '-', ...a);
 const app = express();
 app.set('trust proxy', true);
 
+// Basic security header
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  next();
+});
+
 // Health check
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-// Hosted tester (uses window.location to pick ws/wss + host dynamically)
+// Hosted tester (auto-chooses ws/wss based on page protocol)
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8">
-<title>WebSocket Tunnel (Heroku)</title>
+<title>WebSocket Tunnel (Heroku/CommonJS)</title>
 <style>
   :root{color-scheme:light dark}
   body{font-family:system-ui;padding:2rem;max-width:960px;margin:auto}
@@ -36,7 +38,7 @@ app.get('/', (_req, res) => {
   input,button{font:inherit;padding:.45rem}
   button:disabled{opacity:.5}
 </style>
-<h1>WebSocket Tunnel (Heroku)</h1>
+<h1>WebSocket Tunnel (Heroku/CommonJS)</h1>
 <p class="muted">This page auto-connects to <code>/ws-tunnel</code> using <code>wss://</code> when loaded over HTTPS (Heroku), otherwise <code>ws://</code>. You’ll see live ping/pong RTT if the tunnel is healthy.</p>
 
 <div class="row"><div>Endpoint</div><div><code id="ep">…</code></div></div>
@@ -76,15 +78,15 @@ app.get('/', (_req, res) => {
 
   function connect(){
     ws = new WebSocket(url);
-    ws.onopen = () => { status.innerHTML = '<span class="ok">OPEN</span>'; log('OPEN '+url); setSend(true); };
+    ws.onopen = () => { status.innerHTML = '<span class="ok">OPEN</span>'; log('OPEN ' + url); setSend(true); };
     ws.onerror = () => { log('ERROR (browser hides details)'); };
     ws.onclose = (e) => { status.innerHTML = '<span class="bad">CLOSED</span> code='+e.code; setSend(false); log('CLOSE code='+e.code+' reason="'+e.reason+'"'); };
     ws.onmessage = (ev) => {
       let m = null;
       try { m = JSON.parse(ev.data); } catch { return log('TEXT ' + ev.data); }
 
-      if (m.type === 'welcome') { log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
-      if (m.type === 'serverPing') { log('serverPing '+m.serverTs); return; }
+      if (m.type === 'welcome') { log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); return; }
+      if (m.type === 'serverPing') { log('serverPing ' + m.serverTs); return; }
       if (m.type === 'pong') {
         const t0 = sent.get(m.id);
         if (t0) {
@@ -93,7 +95,7 @@ app.get('/', (_req, res) => {
           rttEl.textContent = mean(rtts).toFixed(1) + ' ms';
           sent.delete(m.id);
         }
-        log('PONG id='+m.id+' serverT='+m.serverTs);
+        log('PONG id=' + m.id + ' serverT=' + m.serverTs);
         return;
       }
       if (m.type === 'say') { log('SAY ' + JSON.stringify(m)); return; }
@@ -109,10 +111,10 @@ app.get('/', (_req, res) => {
       const id = Math.random().toString(36).slice(2);
       sent.set(id, performance.now());
       ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
-      log('PING id='+id);
+      log('PING id=' + id);
     } else {
       ws.send(JSON.stringify({ type:'say', text, clientTs: Date.now() }));
-      log('SEND text='+text);
+      log('SEND text=' + text);
     }
     input.value = '';
   };
@@ -122,36 +124,33 @@ app.get('/', (_req, res) => {
 </script>`);
 });
 
-// ──────────────────────────────
-// HTTP server + WebSocket endpoints on the SAME PORT
-// (Heroku requires binding only process.env.PORT)
-// ──────────────────────────────
+// Single HTTP server on one port (Heroku style)
 const server = http.createServer(app);
 
-// Loud upgrade logs so you can see if the router forwards the Upgrade
+// Loud upgrade logs — confirms Upgrade reaches your dyno
 server.on('upgrade', (req, _sock) => {
   console.log(new Date().toISOString(),
     ` - UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'}`);
 });
 
-// Primary tunnel endpoint
+// Attach WS endpoints on the same server/port
 attachTunnelWSS(server);
-// Tiny echo endpoint to prove text frames work
 attachEchoWSS(server);
 
+// Start
 server.listen(CONFIG.PORT, '0.0.0.0', () => {
-  log(\`web process listening on :\${CONFIG.PORT} (Heroku)\`);
+  log(`web process listening on :${CONFIG.PORT} (Heroku-compatible)`);
 });
 
 // ──────────────────────────────
-// WS handlers
+// WebSocket handlers
 // ──────────────────────────────
 function attachEchoWSS(server) {
   const wss = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
   wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
     const origin = req.headers.origin || '(null)';
-    log(\`ECHO connected ip=\${ip} origin=\${origin}\`);
+    log(`ECHO connected ip=${ip} origin=${origin}`);
     try { ws.send(JSON.stringify({ type: 'hello', app: CONFIG.APP_NAME })); } catch {}
     setTimeout(() => { try { ws.close(1000, 'bye'); } catch {} }, 200);
   });
@@ -165,17 +164,17 @@ function attachTunnelWSS(server) {
     const origin = req.headers.origin || '(null)';
     const ua = req.headers['user-agent'] || '(ua?)';
     const clientId = Math.random().toString(36).slice(2);
-    log(\`TUNNEL connected ip=\${ip} origin=\${origin} ua="\${ua}" id=\${clientId}\`);
+    log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
     // Welcome text frame
     safeSend(ws, { type: 'welcome', clientId, serverTs: Date.now() });
 
-    // Control keepalive (browser auto-pongs); 25s < 55s Heroku idle timeout
+    // Control keepalive (browser auto-pongs); keep < Heroku idle (~55s)
     const ctrlPing = setInterval(() => {
       if (ws.readyState === ws.OPEN) { try { ws.ping(); } catch {} }
     }, 25000);
 
-    // Application heartbeat (visible)
+    // Application heartbeat (visible to client)
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
     }, 15000);
@@ -186,10 +185,10 @@ function attachTunnelWSS(server) {
         return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
       }
 
-      if (m?.type === 'ping') {
+      if (m && m.type === 'ping') {
         return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
       }
-      if (m?.type === 'say') {
+      if (m && m.type === 'say') {
         return safeSend(ws, { type: 'say', echo: m.text ?? '', serverTs: Date.now() });
       }
       safeSend(ws, { type: 'error', message: 'Unsupported message type' });
@@ -199,7 +198,7 @@ function attachTunnelWSS(server) {
     ws.on('close', (code, reason) => {
       clearInterval(ctrlPing); clearInterval(appBeat);
       const r = reason && reason.toString ? reason.toString() : '';
-      log(\`TUNNEL closed id=\${clientId} code=\${code} reason="\${r}"\`);
+      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}"`);
     });
   });
 }
