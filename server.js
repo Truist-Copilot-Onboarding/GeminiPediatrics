@@ -57,6 +57,7 @@ app.get('/', (_req, res) => {
     <div>
       <input id="msg" placeholder='Type text (or "ping")'/>
       <button id="send" disabled>Send</button>
+      <button id="reconnect">Reconnect</button> <!-- CHANGE: Added reconnect button -->
     </div>
   </div>
 </div>
@@ -74,6 +75,7 @@ app.get('/', (_req, res) => {
   const logEl=document.getElementById('log');
   const rttEl=document.getElementById('rtt');
   const sendBtn=document.getElementById('send');
+  const reconnectBtn=document.getElementById('reconnect');
   const input=document.getElementById('msg');
 
   const log=(m)=>{ const s=new Date().toISOString()+' '+m; console.log(s); logEl.textContent += s+"\\n"; logEl.scrollTop = logEl.scrollHeight; };
@@ -83,10 +85,16 @@ app.get('/', (_req, res) => {
   let ws, sent = new Map(), rtts=[];
 
   function connect(){
+    log('Attempting connection to '+url); // CHANGE: Log connection attempt
     ws = new WebSocket(url);
     ws.onopen = ()=>{ status.innerHTML='<span class="ok">OPEN</span>'; log('OPEN '+url); setSend(true); };
-    ws.onerror = ()=>{ log('ERROR (browser hides details)'); };
-    ws.onclose = (e)=>{ status.innerHTML='<span class="bad">CLOSED</span> code='+e.code; setSend(false); log('CLOSE code='+e.code+' reason="'+e.reason+'"'); };
+    ws.onerror = (e)=>{ log('ERROR (browser hides details)'); }; // CHANGE: Simplified error logging
+    ws.onclose = (e)=>{
+      status.innerHTML='<span class="bad">CLOSED</span> code='+e.code; 
+      setSend(false); 
+      log('CLOSE code='+e.code+' reason="'+e.reason+'"');
+      setTimeout(connect, 3000); // CHANGE: Auto-reconnect after 3s
+    };
     ws.onmessage = (ev)=>{
       let m=null; try{ m = JSON.parse(ev.data); } catch { return log('TEXT '+ev.data); }
       if (m.type==='welcome'){ log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
@@ -115,6 +123,11 @@ app.get('/', (_req, res) => {
       log('SEND text='+text);
     }
     input.value='';
+  };
+
+  reconnectBtn.onclick = ()=>{ // CHANGE: Manual reconnect
+    if (ws) ws.close();
+    connect();
   };
 
   connect();
@@ -158,7 +171,7 @@ app.get('/logs', (req, res) => {
   const onLine = (line) => send(line);
   bus.on('line', onLine);
   send(`${new Date().toISOString()} - [SSE] connected from ${req.ip || req.socket.remoteAddress}`);
-  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 25000);
+  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 15000); // CHANGE: Reduced to 15s
   req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
 });
 
@@ -172,7 +185,7 @@ server.on('clientError', (err, socket) => {
 });
 
 server.on('upgrade', (req, _sock) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'}`);
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'}`); // CHANGE: Added protocol
 });
 
 // Attach WS endpoints
@@ -199,7 +212,7 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false,            // safe default for intermediaries
+    perMessageDeflate: false,
     maxPayload: 100 * 1024 * 1024
   });
 
@@ -211,8 +224,13 @@ function attachTunnelWSS(server) {
   wss.on('connection', (ws, req) => {
     // ---- Raw socket hygiene immediately on connect
     const s = ws._socket;
-    try { s.setNoDelay(true); } catch {}
-    try { s.setKeepAlive(true, 10000); } catch {} // 10s initial probe
+    try { 
+      s.setNoDelay(true); 
+      s.setKeepAlive(true, 5000); // CHANGE: Reduced to 5s
+      log('TUNNEL socket options set: noDelay=true, keepAlive=5s');
+    } catch (e) {
+      log('TUNNEL socket options error', e?.message || e); // CHANGE: Log socket option errors
+    }
 
     attachRawSocketLogs(ws, 'TUNNEL');
 
@@ -222,19 +240,33 @@ function attachTunnelWSS(server) {
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-    // ---- Send something immediately (some intermediaries close if idle)
+    // ---- Send immediate ping to keep connection alive
+    try { 
+      ws.ping(); 
+      log('TUNNEL sent initial ping');
+    } catch (e) {
+      log('TUNNEL initial ping error', e?.message || e); // CHANGE: Log ping errors
+    }
+
+    // ---- Send welcome message
     safeSend(ws, { type: 'welcome', clientId, serverTs: Date.now() });
 
-    // Also send a tiny "tick" frame to prove traffic exists right away
-    try { if (ws.readyState === ws.OPEN) ws.send(' '); } catch {}
+    // ---- If client pings the server, answer
+    ws.on('ping', () => { 
+      try { 
+        ws.pong(); 
+        log('TUNNEL pong sent'); 
+      } catch {} 
+    });
 
-    // ---- If client pings the server, answer (defensive)
-    ws.on('ping', () => { try { ws.pong(); } catch {} });
-
-    // ---- Visible heartbeat (keep under typical idle timeouts)
+    // ---- Visible heartbeat (faster for Heroku)
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
-    }, 15000);
+      try { 
+        ws.ping(); // CHANGE: Add WebSocket-level ping
+        log('TUNNEL heartbeat ping sent');
+      } catch {}
+    }, 5000); // CHANGE: Reduced to 5s
 
     // ---- Handle app messages
     ws.on('message', (data) => {
@@ -255,7 +287,7 @@ function attachTunnelWSS(server) {
     ws.on('close', (code, reason) => {
       clearInterval(appBeat);
       const r = reason && reason.toString ? reason.toString() : '';
-      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}"`);
+      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState}`); // CHANGE: Log socket state
     });
   });
 }
@@ -264,11 +296,16 @@ function attachRawSocketLogs(ws, label) {
   const s = ws._socket;
   if (!s) return;
   try { s.setNoDelay(true); } catch {}
-  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr}`));
-  s.on('end', () => log(`${label} RAW end`));
+  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState}`)); // CHANGE: Log socket state
+  s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`)); // CHANGE: Log socket state
   s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
   s.on('timeout', () => log(`${label} RAW timeout`));
 }
 
-function safeSend(ws, obj) { try { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); } catch {} }
-
+function safeSend(ws, obj) { 
+  try { 
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); 
+  } catch (e) { 
+    log('safeSend error', e?.message || e); // CHANGE: Log send errors
+  } 
+}
