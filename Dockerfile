@@ -1,18 +1,26 @@
-# Small, production Node image
 FROM node:20-alpine
 
 WORKDIR /app
 
-# Install only prod deps
+# System tools for fallback cert + optional LE issuance
+RUN apk add --no-cache openssl certbot
+
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# App code
 COPY server.js ./
 
-# Heroku ignores EXPOSE, but it's fine to document
-EXPOSE 3000
+# Document both ports
+EXPOSE 80 443
 
-# Start
+# Defaults for dual-port mode
+ENV HTTP_PORT=80
+ENV HTTPS_PORT=443
+# Set your domain + certbot email via env or edit server.js CONFIG
+# ENV HOSTNAME=example.com
+# ENV CERTBOT_EMAIL=admin@example.com
+# ENV CERTBOT_ENABLED=true
+# ENV CERTBOT_STAGING=false
+
 CMD ["node", "server.js"]
 
