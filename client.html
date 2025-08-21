@@ -1,0 +1,242 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WebSocket Tunnel Client (Heroku)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{color-scheme:light dark}
+  body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.4;margin:0;background:Canvas;color:CanvasText}
+  header{padding:16px 20px;border-bottom:1px solid #0001}
+  main{padding:16px 20px;max-width:1000px;margin:auto}
+  .row{display:grid;grid-template-columns:150px 1fr;gap:.5rem 1rem;align-items:center;margin:.35rem 0}
+  input,button{font:inherit;padding:.45rem}
+  button{cursor:pointer}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  .btns button{margin-right:.5rem;margin-bottom:.5rem}
+  .ok{color:#0b7}.bad{color:#b22}.muted{opacity:.8}
+  .card{border:1px solid #0002;border-radius:10px;padding:12px;margin:12px 0;background:Color(srgb 1 1 1 / 0.03)}
+  pre{background:#111;color:#0f0;padding:12px;border-radius:8px;white-space:pre-wrap;max-height:320px;overflow:auto}
+  code{background:#0002;border-radius:4px;padding:0 .25rem}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+</style>
+
+<header>
+  <h1>WebSocket Tunnel Client</h1>
+  <div class="muted">Targets your Heroku server’s <code>/ws-tunnel</code> endpoint.</div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="row"><div>Host</div>
+      <div>
+        <input id="host" style="width:360px" />
+        <span class="muted">hostname only (no scheme). Example: <code>gemini-pediatrics-414693e8e186.herokuapp.com</code></span>
+      </div>
+    </div>
+    <div class="row"><div>Path</div>
+      <div>
+        <input id="path" value="/ws-tunnel" style="width:240px" />
+      </div>
+    </div>
+    <div class="row"><div>Ports</div>
+      <div>
+        ws: <input id="wsPort" type="number" value="80" style="width:90px" />
+        &nbsp; wss: <input id="wssPort" type="number" value="443" style="width:90px" />
+        <span class="muted">Heroku uses standard ports (80/443)</span>
+      </div>
+    </div>
+    <div class="row"><div>Endpoints</div>
+      <div>
+        <div>WS : <code id="wsUrl">ws://…</code></div>
+        <div>WSS: <code id="wssUrl">wss://…</code></div>
+      </div>
+    </div>
+    <div class="row"><div>Controls</div>
+      <div class="btns">
+        <button id="auto">Auto (ws→wss)</button>
+        <button id="connect-ws">Connect WS</button>
+        <button id="connect-wss">Connect WSS</button>
+        <button id="close" disabled>Close</button>
+      </div>
+    </div>
+    <div class="row"><div>Status</div>
+      <div id="status">Idle</div>
+    </div>
+    <div class="row"><div>Transport</div>
+      <div id="transport">–</div>
+    </div>
+    <div class="row"><div>RTT (avg)</div>
+      <div id="rtt">–</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row"><div>Send</div>
+      <div class="btns">
+        <input id="msg" placeholder='Type text (or "ping")' style="width:320px" />
+        <button id="send" disabled>Send</button>
+        <button id="send-ping" disabled>Send Ping</button>
+        <button id="auto-ping" disabled>Auto Ping</button>
+        <button id="stop-ping" disabled>Stop</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="grid-2">
+      <div>
+        <div class="row"><div>Log</div><div></div></div>
+        <pre id="log"></pre>
+      </div>
+      <div>
+        <div class="row"><div>Notes</div><div></div></div>
+        <ul>
+          <li>If WSS fails on first contact, open <code>https://gemini-pediatrics-414693e8e186.herokuapp.com/</code> once in a tab, then retry connect.</li>
+          <li>Server sends periodic <code>serverPing</code>; you should see those in the log.</li>
+          <li>Close code <code>1006</code> usually means a middlebox terminated the connection.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function(){
+  // Default to your Heroku hostname (no scheme)
+  const DEFAULT_HOST = 'gemini-pediatrics-414693e8e186.herokuapp.com';
+
+  // --- UI refs
+  const $ = (id) => document.getElementById(id);
+  const host = $('host'), path = $('path'), wsPort = $('wsPort'), wssPort = $('wssPort');
+  const wsUrlEl = $('wsUrl'), wssUrlEl = $('wssUrl');
+  const status = $('status'), transport = $('transport'), rttEl = $('rtt');
+  const logEl = $('log'), input = $('msg');
+  const btnAuto = $('auto'), btnWs = $('connect-ws'), btnWss = $('connect-wss'), btnClose = $('close');
+  const btnSend = $('send'), btnPing = $('send-ping'), btnAutoPing = $('auto-ping'), btnStopPing = $('stop-ping');
+
+  // Initialize defaults
+  host.value = DEFAULT_HOST;
+
+  function buildWsUrl(h, p, port, scheme) {
+    h = (h || '').trim(); p = (p || '/ws-tunnel').trim();
+    if (!p.startsWith('/')) p = '/' + p;
+    // If host already has :port, keep it; else add our port.
+    const hasPort = /\:\d+$/.test(h);
+    const hp = hasPort ? h : h + ':' + port;
+    return scheme + '://' + hp + p;
+  }
+  function refreshUrls(){
+    wsUrlEl.textContent  = buildWsUrl(host.value, path.value, wsPort.value, 'ws');
+    wssUrlEl.textContent = buildWsUrl(host.value, path.value, wssPort.value, 'wss');
+  }
+  [host, path, wsPort, wssPort].forEach(el => el.addEventListener('input', refreshUrls));
+  refreshUrls();
+
+  // Logging & state
+  const log = (m) => { const s = new Date().toISOString() + ' ' + m; console.log(s); logEl.textContent += s + "\\n"; logEl.scrollTop = logEl.scrollHeight; };
+  const setStatus = (html, good) => { status.innerHTML = good ? '<span class="ok">'+html+'</span>' : '<span class="bad">'+html+'</span>'; };
+  const setSendEnabled = (on) => { btnSend.disabled = btnPing.disabled = btnAutoPing.disabled = btnStopPing.disabled = !on; btnClose.disabled = !on; };
+
+  let ws = null, rtts = [], sent = new Map(), pingTimer = null;
+  const mean = (a)=> a.length ? (a.reduce((x,y)=>x+y,0)/a.length) : 0;
+
+  function attachHandlers(sock, label) {
+    if (ws && ws.readyState === WebSocket.OPEN) { try { ws.close(1000, 'switch'); } catch(e){} }
+    ws = sock; transport.textContent = label; setSendEnabled(true); setStatus('OPEN', true);
+
+    ws.onmessage = (ev) => {
+      let m = null; try { m = JSON.parse(ev.data); } catch { return log('TEXT ' + ev.data); }
+      if (m.type === 'welcome') { log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
+      if (m.type === 'serverPing') { log('serverPing '+m.serverTs); return; }
+      if (m.type === 'pong') {
+        const t0 = sent.get(m.id);
+        if (t0) {
+          const dt = performance.now() - t0;
+          rtts.push(dt); if (rtts.length>20) rtts.shift();
+          rttEl.textContent = mean(rtts).toFixed(1) + ' ms';
+          sent.delete(m.id);
+        }
+        log('PONG id='+m.id+' serverT='+m.serverTs); return;
+      }
+      if (m.type === 'say') { log('SAY '+JSON.stringify(m)); return; }
+      if (m.type === 'error') { log('ERROR '+m.message); return; }
+      log('MSG '+JSON.stringify(m));
+    };
+    ws.onerror = () => { log('ERROR (browser hides details)'); };
+    ws.onclose = (e) => {
+      setStatus('CLOSED code='+e.code, false); setSendEnabled(false);
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+      log('CLOSE code='+e.code+' reason="'+e.reason+'"');
+    };
+  }
+
+  function open(url) {
+    return new Promise((resolve) => {
+      let opened = false;
+      const s = new WebSocket(url);
+      s.onopen = () => { opened = true; resolve({ ok: true, ws: s }); };
+      s.onerror = () => { /* details hidden */ };
+      s.onclose = (e) => { if (!opened) resolve({ ok: false, reason: 'close-'+e.code }); };
+    });
+  }
+
+  async function connectWS() {
+    const url = wsUrlEl.textContent;
+    setStatus('Connecting WS…'); log('CONNECT ' + url);
+    const r = await open(url);
+    if (r.ok) { attachHandlers(r.ws, 'ws:' + wsPort.value); log('OPEN ws'); }
+    else { setStatus('WS failed ('+(r.reason||'unknown')+')', false); log('WS failed '+(r.reason||'?')); }
+  }
+  async function connectWSS() {
+    const url = wssUrlEl.textContent;
+    setStatus('Connecting WSS…'); log('CONNECT ' + url);
+    const r = await open(url);
+    if (r.ok) { attachHandlers(r.ws, 'wss:' + wssPort.value); log('OPEN wss'); }
+    else { setStatus('WSS failed ('+(r.reason||'unknown')+')', false); log('WSS failed '+(r.reason||'?')); }
+  }
+  async function connectAuto() {
+    setStatus('Trying WS…'); await connectWS();
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+    setStatus('WS failed — trying WSS…'); await connectWSS();
+  }
+
+  // Send actions
+  btnSend.onclick = () => {
+    if (!ws || ws.readyState !== ws.OPEN) { log('SEND blocked (socket not open)'); return; }
+    const text = (input.value || 'ping').trim();
+    if (text.toLowerCase() === 'ping') { btnPing.click(); return; }
+    ws.send(JSON.stringify({ type:'say', text, clientTs: Date.now() }));
+    log('SEND text=' + text);
+    input.value = '';
+  };
+
+  btnPing.onclick = () => {
+    if (!ws || ws.readyState !== ws.OPEN) { log('PING blocked (socket not open)'); return; }
+    const id = Math.random().toString(36).slice(2);
+    sent.set(id, performance.now());
+    ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
+    log('PING id=' + id);
+  };
+
+  btnAutoPing.onclick = () => {
+    if (!ws || ws.readyState !== ws.OPEN) { log('AutoPing blocked (socket not open)'); return; }
+    if (pingTimer) return;
+    pingTimer = setInterval(()=>btnPing.click(), 2000);
+    log('AutoPing: started (2s)');
+    btnAutoPing.disabled = true; btnStopPing.disabled = false;
+  };
+
+  btnStopPing.onclick = () => {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; log('AutoPing: stopped'); }
+    btnAutoPing.disabled = false; btnStopPing.disabled = true;
+  };
+
+  btnWs.onclick = connectWS;
+  btnWss.onclick = connectWSS;
+  btnAuto.onclick = connectAuto;
+  btnClose.onclick = () => { if (ws) try { ws.close(1000, 'client-close'); } catch(e){} };
+
+  // Optional: auto-try WSS first for Heroku
+  (async ()=>{ setStatus('Trying WSS…'); await connectWSS(); if(!(ws && ws.readyState===WebSocket.OPEN)){ setStatus('WSS failed — trying WS…'); await connectWS(); } })();
+})();
+</script>
+
