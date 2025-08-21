@@ -119,29 +119,37 @@ app.get('/', (_req, res) => {
       log('OPEN '+url); 
       setSend(true); 
       reconnectAttempts = 0;
-      // CHANGE: Send multiple pings to ensure activity
-      const id1 = Math.random().toString(36).slice(2);
-      sent.set(id1, performance.now());
-      ws.send(JSON.stringify({ type:'ping', id: id1, clientTs: Date.now() }));
-      log('Client sent initial ping id='+id1);
-      setTimeout(() => {
-        if (ws.readyState === ws.OPEN) {
-          const id2 = Math.random().toString(36).slice(2);
-          sent.set(id2, performance.now());
-          ws.send(JSON.stringify({ type:'ping', id: id2, clientTs: Date.now() }));
-          log('Client sent second ping id='+id2);
-        }
-      }, 100);
+      // CHANGE: Send multiple pings
+      try {
+        const id1 = Math.random().toString(36).slice(2);
+        sent.set(id1, performance.now());
+        ws.send(JSON.stringify({ type:'ping', id: id1, clientTs: Date.now() }));
+        log('Client sent initial ping id='+id1);
+        setTimeout(() => {
+          if (ws.readyState === ws.OPEN) {
+            const id2 = Math.random().toString(36).slice(2);
+            sent.set(id2, performance.now());
+            ws.send(JSON.stringify({ type:'ping', id: id2, clientTs: Date.now() }));
+            log('Client sent second ping id='+id2);
+          }
+        }, 50);
+      } catch (e) {
+        log('Client send error: '+e.message); // CHANGE: Log send errors
+      }
       const heartbeat = setInterval(() => {
         if (ws.readyState === ws.OPEN) {
-          const id = Math.random().toString(36).slice(2);
-          sent.set(id, performance.now());
-          ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
-          log('Client heartbeat ping id='+id);
+          try {
+            const id = Math.random().toString(36).slice(2);
+            sent.set(id, performance.now());
+            ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
+            log('Client heartbeat ping id='+id);
+          } catch (e) {
+            log('Client heartbeat error: '+e.message);
+          }
         } else {
           clearInterval(heartbeat);
         }
-      }, 2000);
+      }, 1000); // CHANGE: Reduced to 1s
     };
     ws.onerror = (e)=>{ log('ERROR (browser hides details)'); };
     ws.onclose = (e)=>{
@@ -149,12 +157,12 @@ app.get('/', (_req, res) => {
       setSend(false); 
       log('CLOSE code='+e.code+' reason="'+e.reason+'"');
       reconnectAttempts++;
-      const delay = Math.min(20000, 5000 + reconnectAttempts * 3000); // CHANGE: Increased backoff
+      const delay = Math.min(20000, 5000 + reconnectAttempts * 3000);
       log('Reconnecting in '+delay+'ms');
       setTimeout(connect, delay);
     };
     ws.onmessage = (ev)=>{
-      log('MESSAGE received length='+ev.data.length+' content='+ev.data.slice(0, 200)); // CHANGE: Log message content
+      log('MESSAGE received length='+ev.data.length+' content='+ev.data.slice(0, 200));
       let m=null; try{ m = JSON.parse(ev.data); } catch { return log('TEXT '+ev.data); }
       if (m.type==='welcome'){ log('WELCOME id='+m.clientId+' serverT='+m.serverTs); return; }
       if (m.type==='serverPing'){ log('serverPing '+m.serverTs); return; }
@@ -174,11 +182,19 @@ app.get('/', (_req, res) => {
     if (text.toLowerCase()==='ping'){
       const id = Math.random().toString(36).slice(2);
       sent.set(id, performance.now());
-      ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
-      log('PING id='+id);
+      try {
+        ws.send(JSON.stringify({ type:'ping', id, clientTs: Date.now() }));
+        log('PING id='+id);
+      } catch (e) {
+        log('Send ping error: '+e.message);
+      }
     } else {
-      ws.send(JSON.stringify({ type:'say', text, clientTs: Date.now() }));
-      log('SEND text='+text);
+      try {
+        ws.send(JSON.stringify({ type:'say', text, clientTs: Date.now() }));
+        log('SEND text='+text);
+      } catch (e) {
+        log('Send text error: '+e.message);
+      }
     }
     input.value='';
   };
@@ -289,12 +305,12 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: true, // CHANGE: Enable compression
+    perMessageDeflate: false, // CHANGE: Disable compression
     maxPayload: 1024 * 1024
   });
 
   wss.on('headers', (headers, req) => {
-    headers.push('Keep-Alive: timeout=30'); // CHANGE: Add keep-alive
+    headers.push('Keep-Alive: timeout=30');
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
@@ -302,8 +318,8 @@ function attachTunnelWSS(server) {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 3000); 
-      log('TUNNEL socket options set: noDelay=true, keepAlive=3s');
+      s.setKeepAlive(true, 2000); // CHANGE: Reduced to 2s
+      log('TUNNEL socket options set: noDelay=true, keepAlive=2s');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
     }
@@ -317,17 +333,18 @@ function attachTunnelWSS(server) {
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
     try {
-      log('TUNNEL socket state before send: readyState='+s.readyState); // CHANGE: Log socket state
+      log('TUNNEL socket state before send: readyState='+s.readyState);
       ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
       log('TUNNEL sent welcome');
-      ws.ping();
-      log('TUNNEL sent initial ping');
+      // CHANGE: Send simple text frame first
+      ws.send('welcome');
+      log('TUNNEL sent text welcome');
       setTimeout(() => {
         if (ws.readyState === ws.OPEN) {
-          ws.ping();
-          log('TUNNEL sent second ping');
+          ws.send(JSON.stringify({ type: 'ping', id: 'server-init', serverTs: Date.now() }));
+          log('TUNNEL sent server ping');
         }
-      }, 100);
+      }, 50);
     } catch (e) {
       log('TUNNEL initial send error', e?.message || e);
     }
@@ -345,11 +362,7 @@ function attachTunnelWSS(server) {
 
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
-      try { 
-        ws.ping(); 
-        log('TUNNEL heartbeat ping sent');
-      } catch {}
-    }, 2000);
+    }, 1000); // CHANGE: Reduced to 1s
 
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
@@ -384,12 +397,15 @@ function attachRawSocketLogs(ws, label) {
   s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`));
   s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
   s.on('timeout', () => log(`${label} RAW timeout`));
-  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`)); // CHANGE: Log data content
+  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`));
 }
 
 function safeSend(ws, obj) { 
   try { 
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); 
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(obj));
+      log('safeSend success: '+JSON.stringify(obj).slice(0, 200));
+    }
   } catch (e) { 
     log('safeSend error', e?.message || e); 
   } 
