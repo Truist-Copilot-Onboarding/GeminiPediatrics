@@ -13,11 +13,10 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 64 * 1024, // 64 KiB chunks
+  CHUNK_SIZE: 64 * 1024,
   CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20,
 };
 
-// Central log bus → broadcasts to SSE clients
 const bus = new EventEmitter();
 function log(...a) {
   const line = `${new Date().toISOString()} - ${a.map(v => (typeof v === 'string' ? v : JSON.stringify(v))).join(' ')}`;
@@ -25,7 +24,6 @@ function log(...a) {
   bus.emit('line', line);
 }
 
-// Catch hidden crashes
 process.on('uncaughtException', (e) => log('UNCAUGHT', e?.stack || e?.message || String(e)));
 process.on('unhandledRejection', (e) => log('UNHANDLED_REJECTION', e?.stack || e?.message || String(e)));
 
@@ -33,10 +31,8 @@ const app = express();
 app.set('trust proxy', true);
 app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
 
-// Health
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-// Direct PDF (inline preview for troubleshooting)
 let PDF_BUFFER = null;
 async function loadPdfBufferOnce() {
   try {
@@ -55,12 +51,11 @@ app.get('/HelloWorld.exe', async (_req, res) => {
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/octet-stream')
+    .setHeader('Content-Type', 'application/octet-stream') // CHANGE: Generic MIME type
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
 
-// Root tester
 app.get('/', (_req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'), (err) => {
     if (err) {
@@ -70,7 +65,6 @@ app.get('/', (_req, res) => {
   });
 });
 
-// Console (SSE)
 app.get('/console', (_req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html>
@@ -136,10 +130,8 @@ app.get('/logs', (req, res) => {
   req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
 });
 
-// HTTP server + WS on same port
 const server = http.createServer(app);
 
-// Diagnostics
 server.on('clientError', (err, socket) => {
   log('HTTP clientError', err?.message || err);
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
@@ -166,7 +158,6 @@ server.listen(CONFIG.PORT, '0.0.0.0', async () => {
   log(`web listening on :${CONFIG.PORT}`);
 });
 
-// WS endpoints
 function attachEchoWSS(server) {
   const wss = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
   wss.on('connection', (ws, req) => {
@@ -287,7 +278,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize, requestId) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/octet-stream', size, chunkSize, chunks, requestId });
+  safeSend(ws, { type: 'fileMeta', name, mime: 'application/octet-stream', size, chunkSize, chunks, requestId }); // CHANGE: Generic MIME type
   log('TUNNEL sent fileMeta for requestId=' + requestId);
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
