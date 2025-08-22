@@ -13,12 +13,10 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 4 * 1024, // CHANGE: Reduced to 4 KiB
+  CHUNK_SIZE: 2 * 1024, // CHANGE: Reduced to 2 KiB
 };
 
-// ──────────────────────────────────────────────
 // Central log bus → broadcasts to SSE clients
-// ──────────────────────────────────────────────
 const bus = new EventEmitter();
 function log(...a) {
   const line = `${new Date().toISOString()} - ${a.map(v => (typeof v === 'string' ? v : JSON.stringify(v))).join(' ')}`;
@@ -59,9 +57,11 @@ app.get('/HelloWorld.exe', async (_req, res) => {
     .send(PDF_BUFFER);
 });
 
-// ────────────────── Root tester ──────────────────
+// Root tester
 app.get('/', (_req, res) => {
-  res.type('html').send(`<!DOCTYPE html>
+  // CHANGE: Simplified and reformatted template string
+  res.type('html').send(`
+<!DOCTYPE html>
 <meta charset="utf-8">
 <title>WS Tunnel (Heroku)</title>
 <style>
@@ -82,15 +82,13 @@ app.get('/', (_req, res) => {
   <strong>Troubleshooting link (inline preview):</strong> <a href="/HelloWorld.exe" target="_blank">/HelloWorld.exe</a><br>
   Live logs at <a href="/console" target="_blank">/console</a>.
 </p>
-
 <div class="row"><div>Endpoint</div><div><code id="ep">…</code></div></div>
 <div class="row"><div>Status</div><div id="status">Connecting…</div></div>
 <div class="row"><div>RTT (avg)</div><div id="rtt">–</div></div>
-
 <div class="card">
   <div class="row"><div>Send</div>
     <div>
-      <input id="msg" placeholder='Type text (or "ping")'/>
+      <input id="msg" placeholder="Type text (or 'ping')"/>
       <button id="send" disabled>Send</button>
       <button id="reconnect">Reconnect</button>
     </div>
@@ -102,7 +100,6 @@ app.get('/', (_req, res) => {
     </div>
   </div>
 </div>
-
 <div class="card">
   <div class="row"><div>Log</div>
     <div>
@@ -111,12 +108,10 @@ app.get('/', (_req, res) => {
     </div>
   </div>
 </div>
-
 <script>
 (function(){
-  const url = (location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws-tunnel';
+  const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws-tunnel';
   document.getElementById('ep').textContent = url;
-
   const status = document.getElementById('status');
   const logEl = document.getElementById('log');
   const rttEl = document.getElementById('rtt');
@@ -126,7 +121,6 @@ app.get('/', (_req, res) => {
   const input = document.getElementById('msg');
   const pdfInfo = document.getElementById('pdfInfo');
   const pdfProg = document.getElementById('pdfProg');
-
   const log = (m) => { 
     const s = new Date().toISOString() + ' ' + m; 
     console.log(s); 
@@ -135,7 +129,6 @@ app.get('/', (_req, res) => {
   };
   const setSend = (on) => sendBtn.disabled = !on;
   const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-
   copyLogsBtn.onclick = async () => {
     try { 
       await navigator.clipboard.writeText(logEl.textContent); 
@@ -151,10 +144,7 @@ app.get('/', (_req, res) => {
       log('Logs copied using fallback');
     }
   };
-
   let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
-
-  // PDF receive state
   let rx = null;
   function b64ToBytes(b64) {
     try {
@@ -164,7 +154,7 @@ app.get('/', (_req, res) => {
       for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xFF;
       return out;
     } catch (e) {
-      log('b64ToBytes error: ' + e.message); // CHANGE: Log decode errors
+      log('b64ToBytes error: ' + e.message);
       return new Uint8Array(0);
     }
   }
@@ -173,7 +163,6 @@ app.get('/', (_req, res) => {
     pdfInfo.textContent = 'waiting…'; 
     pdfProg.value = 0; 
   }
-
   function connect() {
     log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
     ws = new WebSocket(url);
@@ -181,7 +170,7 @@ app.get('/', (_req, res) => {
       status.innerHTML = '<span class="ok">OPEN</span>'; 
       log('OPEN ' + url); 
       setSend(true); 
-      reconnectAttempts = 0; // CHANGE: Reset attempts
+      reconnectAttempts = 0;
       try {
         const id1 = Math.random().toString(36).slice(2);
         sent.set(id1, performance.now());
@@ -211,30 +200,29 @@ app.get('/', (_req, res) => {
         } else {
           clearInterval(heartbeat);
         }
-      }, 2000); // CHANGE: 2s heartbeat
+      }, 2000);
     };
     ws.onerror = () => { 
       log('ERROR (browser hides details)'); 
-      status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.exe">direct download</a>'; // CHANGE: Fallback UI
+      status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.exe">direct download</a>';
     };
     ws.onclose = (e) => {
       status.innerHTML = '<span class="bad">CLOSED</span> code=' + e.code; 
       setSend(false); 
       log('CLOSE code=' + e.code + ' reason="' + e.reason + '"');
-      reconnectAttempts++; // CHANGE: Fix increment
+      reconnectAttempts++;
       const delay = Math.min(20000, 5000 + reconnectAttempts * 3000);
       log('Reconnecting in ' + delay + 'ms');
       setTimeout(connect, delay);
     };
     ws.onmessage = (ev) => {
-      log('MESSAGE received length=' + ev.data.length + ' content=' + ev.data.slice(0, 200)); // CHANGE: Log message content
+      log('MESSAGE received length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
       let m = null; 
       try { 
         m = JSON.parse(ev.data); 
       } catch { 
         return log('TEXT ' + String(ev.data).slice(0, 200)); 
       }
-
       if (m.type === 'welcome') { 
         log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); 
         try {
@@ -255,7 +243,6 @@ app.get('/', (_req, res) => {
         log('ERROR ' + m.message); 
         return; 
       }
-
       if (m.type === 'pong') {
         const t0 = sent.get(m.id);
         if (t0) { 
@@ -268,8 +255,6 @@ app.get('/', (_req, res) => {
         log('PONG id=' + m.id + ' serverT=' + m.serverTs); 
         return; 
       }
-
-      // File transfer
       if (m.type === 'fileMeta') {
         resetRx();
         rx = {
@@ -282,7 +267,7 @@ app.get('/', (_req, res) => {
           gotChunks: 0,
           buf: new Uint8Array(Number(m.size) || 0)
         };
-        pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
+        pdfInfo.textContent = \`Receiving \${rx.name} (\${rx.size} bytes) in \${rx.totalChunks} chunks...\`;
         pdfProg.max = rx.size || 100;
         log('FILE META ' + JSON.stringify(m));
         return;
@@ -299,7 +284,7 @@ app.get('/', (_req, res) => {
           rx.gotChunks++;
           if (rx.size) pdfProg.value = rx.offset;
           if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-            log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B)`);
+            log(\`FILE CHUNK \${rx.gotChunks}/\${rx.totalChunks} (+\${bytes.length}B)\`);
           }
         } catch (e) {
           log('FILE CHUNK error: ' + e.message);
@@ -324,7 +309,6 @@ app.get('/', (_req, res) => {
         rx = null;
         return;
       }
-
       if (m.type === 'say') { 
         log('SAY ' + JSON.stringify(m)); 
         return; 
@@ -332,7 +316,6 @@ app.get('/', (_req, res) => {
       log('MSG ' + JSON.stringify(m));
     };
   }
-
   sendBtn.onclick = () => {
     if (!ws || ws.readyState !== ws.OPEN) { 
       log('SEND blocked (socket not open)'); 
@@ -358,7 +341,6 @@ app.get('/', (_req, res) => {
     }
     input.value = '';
   };
-
   reconnectBtn.onclick = () => { 
     try { if (ws) ws.close(); } catch {} 
     connect(); 
@@ -369,9 +351,10 @@ app.get('/', (_req, res) => {
 `);
 });
 
-// ───────────── /console (SSE) ─────────────
+// Console (SSE)
 app.get('/console', (_req, res) => {
-  res.type('html').send(`<!DOCTYPE html>
+  res.type('html').send(`
+<!DOCTYPE html>
 <meta charset="utf-8">
 <title>WS Server Console</title>
 <style>
@@ -428,7 +411,7 @@ app.get('/logs', (req, res) => {
   req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
 });
 
-// ─────────── HTTP server + WS on same port ───────────
+// HTTP server + WS on same port
 const server = http.createServer(app);
 
 // Diagnostics
@@ -451,7 +434,7 @@ server.listen(CONFIG.PORT, '0.0.0.0', async () => {
   log(`web listening on :${CONFIG.PORT}`);
 });
 
-// ─────────── WS endpoints ───────────
+// WS endpoints
 function attachEchoWSS(server) {
   const wss = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
   wss.on('connection', (ws, req) => {
@@ -468,12 +451,12 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false, // CHANGE: Keep disabled
+    perMessageDeflate: false,
     maxPayload: 100 * 1024 * 1024
   });
 
   wss.on('headers', (headers, req) => {
-    headers.push('Keep-Alive: timeout=30'); // CHANGE: Add keep-alive
+    headers.push('Keep-Alive: timeout=30');
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
@@ -481,7 +464,7 @@ function attachTunnelWSS(server) {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 2000); // CHANGE: Reduced to 2s
+      s.setKeepAlive(true, 2000); 
       log('TUNNEL socket options set: noDelay=true, keepAlive=2s');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
@@ -495,7 +478,6 @@ function attachTunnelWSS(server) {
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-    // CHANGE: Send welcome and ping
     try {
       log('TUNNEL socket state before send: readyState=' + s.readyState);
       ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
@@ -506,16 +488,13 @@ function attachTunnelWSS(server) {
       log('TUNNEL initial send error', e?.message || e);
     }
 
-    // CHANGE: Track client readiness
     let clientReady = false;
 
-    // App heartbeat
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
       log('TUNNEL sent heartbeat ping');
-    }, 2000); // CHANGE: 2s heartbeat
+    }, 2000);
 
-    // Handle messages
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
       let m = null;
@@ -583,8 +562,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    // CHANGE: Add 200ms delay between chunks
-    await new Promise(resolve => setTimeout(resolve, 200));
+    await new Promise(resolve => setTimeout(resolve, 300)); // CHANGE: 300ms delay
   }
   safeSend(ws, { type: 'fileEnd', name, ok: true });
   log('TUNNEL sent fileEnd');
