@@ -105,7 +105,7 @@ app.get('/files/:fileName', async (req, res) => {
   if (!file) return res.status(404).type('text').send('File not found.');
   let finalBuffer = file.buffer;
   let finalMime = getMimeType(fileName);
-  if (!file.isValidZip) {
+  if (!file.isValidZip && finalMime !== 'application/zip') {
     log(`Wrapping non-ZIP file ${fileName} in ZIP for direct download`);
     const zip = new AdmZip();
     zip.addFile(fileName, file.buffer);
@@ -331,9 +331,9 @@ wss.on('connection', (ws, req) => {
       if (!file) {
         return safeSend(ws, { type: 'error', message: `File ${fileName} not found on server.` });
       }
-      transfers.set(m.id, { type: 'download', id: m.id, fileName, originalName: m.originalName || fileName.replace(/\.zip$/, ''), size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
+      transfers.set(m.id, { type: 'download', id: m.id, fileName, originalName: fileName, size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
       try { 
-        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, m.originalName || fileName.replace(/\.zip$/, ''), ip, transfers, file.isValidZip); 
+        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, fileName, ip, transfers, file.isValidZip); 
       } catch (e) { 
         safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
         transfers.delete(m.id);
@@ -434,7 +434,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalN
   let finalHash = hash;
   let finalMime = getMimeType(name);
 
-  if (!isValidZip) {
+  if (!isValidZip && finalMime !== 'application/zip') {
     log(`Wrapping non-ZIP file ${name} in ZIP for WebSocket transfer from ip=${ip}`);
     const zip = new AdmZip();
     zip.addFile(originalName, buffer);

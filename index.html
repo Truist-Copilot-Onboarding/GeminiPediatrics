@@ -223,15 +223,11 @@
             <button id="downloadLogs">Download Logs</button>
             <button id="pauseLogs">Pause Logs</button>
             <input id="searchLogs" placeholder="Search logs..."/>
-            <select id="logFilter">
-              <option value="all">Show All Logs</option>
-              <option value="hide-ping-pong">Hide Ping/Pong/Heartbeats</option>
-              <option value="show-ping-pong">Show Only Ping/Pong/Heartbeats</option>
-              <option value="show-file-transfers">Show Only File Transfers</option>
-              <option value="show-errors">Show Only Errors</option>
-              <option value="show-connections">Show Only Connection Events</option>
-              <option value="show-messages">Show Only Messages</option>
-            </select>
+            <label><input type="checkbox" id="filterPingPong"> Ping/Pong/Heartbeats</label>
+            <label><input type="checkbox" id="filterFileTransfers"> File Transfers</label>
+            <label><input type="checkbox" id="filterErrors"> Errors</label>
+            <label><input type="checkbox" id="filterConnections"> Connection Events</label>
+            <label><input type="checkbox" id="filterMessages"> Messages</label>
           </div>
           <pre id="log"></pre>
         </div>
@@ -251,7 +247,11 @@
       const downloadLogsBtn = document.getElementById('downloadLogs');
       const pauseLogsBtn = document.getElementById('pauseLogs');
       const searchLogs = document.getElementById('searchLogs');
-      const logFilter = document.getElementById('logFilter');
+      const filterPingPong = document.getElementById('filterPingPong');
+      const filterFileTransfers = document.getElementById('filterFileTransfers');
+      const filterErrors = document.getElementById('filterErrors');
+      const filterConnections = document.getElementById('filterConnections');
+      const filterMessages = document.getElementById('filterMessages');
       const fileSelect = document.getElementById('fileSelect');
       const downloadBtn = document.getElementById('downloadBtn');
       const deleteBtn = document.getElementById('deleteBtn');
@@ -290,7 +290,13 @@
       const updateLogDisplay = () => {
         if (isPaused) return;
         const searchTerm = searchLogs.value.toLowerCase();
-        const filterValue = logFilter.value;
+        const filters = [
+          filterPingPong.checked ? 'ping-pong' : null,
+          filterFileTransfers.checked ? 'file-transfers' : null,
+          filterErrors.checked ? 'errors' : null,
+          filterConnections.checked ? 'connections' : null,
+          filterMessages.checked ? 'messages' : null
+        ].filter(f => f);
         const filteredLogs = logLines.filter(line => {
           const isPingPong = line.includes('PING') || line.includes('PONG') || line.includes('serverPing') || line.includes('heartbeat');
           const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
@@ -298,13 +304,13 @@
           const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
           const isConnection = line.includes('OPEN') || line.includes('CLOSE') || line.includes('ERROR') || line.includes('WELCOME');
           const isMessage = line.includes('SAY') || line.includes('MSG');
-          if (filterValue === 'hide-ping-pong' && isPingPong) return false;
-          if (filterValue === 'show-ping-pong' && !isPingPong) return false;
-          if (filterValue === 'show-file-transfers' && !isFileTransfer) return false;
-          if (filterValue === 'show-errors' && !isError) return false;
-          if (filterValue === 'show-connections' && !isConnection) return false;
-          if (filterValue === 'show-messages' && !isMessage) return false;
-          return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
+          if (filters.length === 0) return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
+          return (filters.includes('ping-pong') && isPingPong) ||
+                 (filters.includes('file-transfers') && isFileTransfer) ||
+                 (filters.includes('errors') && isError) ||
+                 (filters.includes('connections') && isConnection) ||
+                 (filters.includes('messages') && isMessage) &&
+                 (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
         });
         logEl.textContent = filteredLogs.join('\n');
         logEl.scrollTop = logEl.scrollHeight;
@@ -357,8 +363,9 @@
         log('Search logs: ' + searchLogs.value);
         updateLogDisplay();
       }, 300);
-      logFilter.onchange = () => {
-        log('Log filter changed to: ' + logFilter.value);
+      filterPingPong.onchange = filterFileTransfers.onchange = filterErrors.onchange = 
+      filterConnections.onchange = filterMessages.onchange = () => {
+        log('Log filters updated');
         updateLogDisplay();
       };
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
@@ -553,9 +560,9 @@
             rx = {
               id: m.id,
               name: m.name || 'download.zip',
-              originalName: m.originalName || m.name.replace(/\.zip$/, '') || 'download.bin',
+              originalName: m.originalName || m.name || 'download.bin', // Preserve full filename
               size: Number(m.size) || 0,
-              mime: 'application/zip',
+              mime: m.mime || 'application/zip',
               totalChunks: Number(m.chunks) || 0,
               chunkSize: Number(m.chunkSize) || 0,
               offset: 0,
@@ -615,7 +622,7 @@
               log(`Downloaded file ${rx.originalName} size=${blob.size}`);
               const a = document.createElement('a');
               a.href = URL.createObjectURL(blob);
-              a.download = rx.originalName;
+              a.download = rx.originalName; // Use full filename
               document.body.appendChild(a);
               a.click();
               setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000);
