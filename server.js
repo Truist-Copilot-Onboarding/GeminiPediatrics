@@ -15,7 +15,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   FILES_DIR: process.env.FILES_DIR || path.join(__dirname, 'files'),
   CHUNK_SIZE: 64 * 1024,
-  MAX_LOG_LINES: 100,
+  MAX_LOG_LINES: 1000, // Increased from 100 to retain more logs
   MAX_FILE_SIZE: 10 * 1024 * 1024 // 10MB limit
 };
 
@@ -58,7 +58,7 @@ app.get('/files', async (req, res) => {
     const fileDetails = await Promise.all(files.map(async (file) => {
       const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
       if (stats.size > 0) {
-        return { name: file, size: stats.size, mime: 'application/zip' };
+        return { name: file, size: stats.size, mime: getMimeType(file) };
       }
       return null;
     }));
@@ -76,9 +76,17 @@ async function loadFileBuffer(fileName) {
   try {
     const buffer = await fsp.readFile(filePath);
     const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-    FILE_CACHE.set(fileName, { buffer, hash });
-    log(`File loaded bytes=${buffer.length} hash=${hash} from ${filePath} (name=${fileName}, mime=application/zip)`);
-    return { buffer, hash };
+    let isValidZip = false;
+    try {
+      const zip = new AdmZip(buffer);
+      zip.getEntries(); // Test if valid ZIP
+      isValidZip = true;
+    } catch (e) {
+      log(`File ${fileName} is not a valid ZIP: ${e.message}`);
+    }
+    FILE_CACHE.set(fileName, { buffer, hash, isValidZip });
+    log(`File loaded bytes=${buffer.length} hash=${hash} isValidZip=${isValidZip} from ${filePath} (name=${fileName}, mime=${getMimeType(fileName)})`);
+    return { buffer, hash, isValidZip };
   } catch (e) {
     log(`File not found at ${filePath}: ${e.message}`);
     return null;
@@ -95,11 +103,20 @@ app.get('/files/:fileName', async (req, res) => {
   let file = FILE_CACHE.get(fileName);
   if (!file) file = await loadFileBuffer(fileName);
   if (!file) return res.status(404).type('text').send('File not found.');
+  let finalBuffer = file.buffer;
+  let finalMime = getMimeType(fileName);
+  if (!file.isValidZip) {
+    log(`Wrapping non-ZIP file ${fileName} in ZIP for direct download`);
+    const zip = new AdmZip();
+    zip.addFile(fileName, file.buffer);
+    finalBuffer = zip.toBuffer();
+    finalMime = 'application/zip';
+  }
   res
     .status(200)
-    .setHeader('Content-Type', 'application/zip')
+    .setHeader('Content-Type', finalMime)
     .setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
-    .send(file.buffer);
+    .send(finalBuffer);
 });
 
 // Delete file
@@ -175,7 +192,7 @@ app.get('/console', (req, res) => {
     const es = new EventSource('/logs');
     es.onmessage = (e) => { 
       logLines.push(e.data); 
-      if (logLines.length > 100) logLines.shift();
+      if (logLines.length > 1000) logLines.shift();
       updateLogDisplay();
     };
     es.onerror = () => { 
@@ -186,7 +203,7 @@ app.get('/console', (req, res) => {
     function updateLogDisplay() {
       const searchTerm = searchLogs.value.toLowerCase();
       const filteredLogs = searchTerm ? logLines.filter(line => line.toLowerCase().includes(searchTerm)) : logLines;
-      out.textContent = filteredLogs.join("\\n"); 
+      out.textContent = filteredLogs.join("\n"); 
       out.scrollTop = out.scrollHeight;
     }
     copyLogsBtn.onclick = async () => {
@@ -316,7 +333,7 @@ wss.on('connection', (ws, req) => {
       }
       transfers.set(m.id, { type: 'download', id: m.id, fileName, originalName: m.originalName || fileName.replace(/\.zip$/, ''), size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
       try { 
-        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, m.originalName || fileName.replace(/\.zip$/, ''), ip, transfers); 
+        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, m.originalName || fileName.replace(/\.zip$/, ''), ip, transfers, file.isValidZip); 
       } catch (e) { 
         safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
         transfers.delete(m.id);
@@ -411,12 +428,25 @@ function attachRawSocketLogs(ws, label, ip) {
   s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip}`));
 }
 
-async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalName, ip, transfers) {
+async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalName, ip, transfers, isValidZip) {
   const start = performance.now();
-  const size = buffer.length;
+  let finalBuffer = buffer;
+  let finalHash = hash;
+  let finalMime = getMimeType(name);
+
+  if (!isValidZip) {
+    log(`Wrapping non-ZIP file ${name} in ZIP for WebSocket transfer from ip=${ip}`);
+    const zip = new AdmZip();
+    zip.addFile(originalName, buffer);
+    finalBuffer = zip.toBuffer();
+    finalHash = crypto.createHash('sha256').update(finalBuffer).digest('hex');
+    finalMime = 'application/zip';
+  }
+
+  const size = finalBuffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  log(`Starting stream for ${name} id=${id} size=${size} mime=application/zip chunks=${chunks} hash=${hash} from ip=${ip}`);
-  safeSend(ws, { type: 'fileMeta', id, name, originalName, mime: 'application/zip', size, chunkSize, chunks, hash });
+  log(`Starting stream for ${name} id=${id} size=${size} mime=${finalMime} chunks=${chunks} hash=${finalHash} from ip=${ip}`);
+  safeSend(ws, { type: 'fileMeta', id, name, originalName, mime: finalMime, size, chunkSize, chunks, hash: finalHash });
   log(`TUNNEL sent fileMeta from ip=${ip}`);
   const transfer = transfers.get(id);
   if (!transfer) {
@@ -436,7 +466,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalN
     const chunkStart = performance.now();
     const start = i * chunkSize;
     const end = Math.min(size, start + chunkSize);
-    const slice = buffer.subarray(start, end);
+    const slice = finalBuffer.subarray(start, end);
     const b64 = slice.toString('base64');
     const chunkHash = crypto.createHash('sha256').update(slice).digest('hex');
     try {
@@ -507,17 +537,6 @@ async function handleFileUpload(ws, m, transfer, ip) {
   }
 }
 
-function attachRawSocketLogs(ws, label, ip) {
-  const s = ws._socket;
-  if (!s) return;
-  try { s.setNoDelay(true); } catch {}
-  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState} from ip=${ip}`));
-  s.on('end', () => log(`${label} RAW end socketState=${s.readyState} from ip=${ip}`));
-  s.on('error', (e) => log(`${label} RAW error from ip=${ip}`, e?.code || '', e?.message || e));
-  s.on('timeout', () => log(`${label} RAW timeout from ip=${ip}`));
-  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip}`));
-}
-
 function safeSend(ws, obj) {
   try { 
     if (ws.readyState === ws.OPEN) {
@@ -530,7 +549,16 @@ function safeSend(ws, obj) {
 }
 
 function getMimeType(fileName) {
-  return 'application/zip'; // All files are zips
+  const ext = path.extname(fileName).toLowerCase();
+  const mimeTypes = {
+    '.zip': 'application/zip',
+    '.exe': 'application/octet-stream',
+    '.txt': 'text/plain',
+    '.pdf': 'application/pdf',
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png'
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
 }
 
 function sanitizeFileName(fileName) {

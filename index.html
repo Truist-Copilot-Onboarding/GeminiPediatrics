@@ -220,9 +220,18 @@
         <div>
           <div class="log-controls">
             <button id="copyLogs">Copy Logs</button>
+            <button id="downloadLogs">Download Logs</button>
             <button id="pauseLogs">Pause Logs</button>
             <input id="searchLogs" placeholder="Search logs..."/>
-            <label><input type="checkbox" id="filterPingPong" checked> Filter Ping/Pong</label>
+            <select id="logFilter">
+              <option value="all">Show All Logs</option>
+              <option value="hide-ping-pong">Hide Ping/Pong/Heartbeats</option>
+              <option value="show-ping-pong">Show Only Ping/Pong/Heartbeats</option>
+              <option value="show-file-transfers">Show Only File Transfers</option>
+              <option value="show-errors">Show Only Errors</option>
+              <option value="show-connections">Show Only Connection Events</option>
+              <option value="show-messages">Show Only Messages</option>
+            </select>
           </div>
           <pre id="log"></pre>
         </div>
@@ -239,9 +248,10 @@
       const sendBtn = document.getElementById('send');
       const reconnectBtn = document.getElementById('reconnect');
       const copyLogsBtn = document.getElementById('copyLogs');
+      const downloadLogsBtn = document.getElementById('downloadLogs');
       const pauseLogsBtn = document.getElementById('pauseLogs');
       const searchLogs = document.getElementById('searchLogs');
-      const filterPingPong = document.getElementById('filterPingPong');
+      const logFilter = document.getElementById('logFilter');
       const fileSelect = document.getElementById('fileSelect');
       const downloadBtn = document.getElementById('downloadBtn');
       const deleteBtn = document.getElementById('deleteBtn');
@@ -249,7 +259,7 @@
       const uploadBtn = document.getElementById('uploadBtn');
       const transferInfo = document.getElementById('transferInfo');
       const transferProg = document.getElementById('transferProg');
-      const MAX_LOG_LINES = 100;
+      const MAX_LOG_LINES = 1000; // Increased from 100 to retain more logs
       let logLines = [], isPaused = false;
       const debounce = (fn, delay) => {
         let timeout;
@@ -280,8 +290,20 @@
       const updateLogDisplay = () => {
         if (isPaused) return;
         const searchTerm = searchLogs.value.toLowerCase();
+        const filterValue = logFilter.value;
         const filteredLogs = logLines.filter(line => {
-          if (filterPingPong.checked && (line.includes('PING') || line.includes('PONG') || line.includes('serverPing'))) return false;
+          const isPingPong = line.includes('PING') || line.includes('PONG') || line.includes('serverPing') || line.includes('heartbeat');
+          const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
+                                line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error');
+          const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
+          const isConnection = line.includes('OPEN') || line.includes('CLOSE') || line.includes('ERROR') || line.includes('WELCOME');
+          const isMessage = line.includes('SAY') || line.includes('MSG');
+          if (filterValue === 'hide-ping-pong' && isPingPong) return false;
+          if (filterValue === 'show-ping-pong' && !isPingPong) return false;
+          if (filterValue === 'show-file-transfers' && !isFileTransfer) return false;
+          if (filterValue === 'show-errors' && !isError) return false;
+          if (filterValue === 'show-connections' && !isConnection) return false;
+          if (filterValue === 'show-messages' && !isMessage) return false;
           return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
         });
         logEl.textContent = filteredLogs.join('\n');
@@ -311,6 +333,20 @@
           log('Logs copied using fallback');
         }
       }, 500);
+      downloadLogsBtn.onclick = debounce(() => {
+        try {
+          const blob = new Blob([logLines.join('\n')], { type: 'text/plain' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = `client_logs_${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000);
+          log('Logs downloaded as file');
+        } catch (e) {
+          log('Download logs failed: ' + e.message);
+        }
+      }, 500);
       pauseLogsBtn.onclick = debounce(() => {
         isPaused = !isPaused;
         pauseLogsBtn.textContent = isPaused ? 'Resume Logs' : 'Pause Logs';
@@ -321,8 +357,8 @@
         log('Search logs: ' + searchLogs.value);
         updateLogDisplay();
       }, 300);
-      filterPingPong.onchange = () => {
-        log('Ping/Pong filter ' + (filterPingPong.checked ? 'enabled' : 'disabled'));
+      logFilter.onchange = () => {
+        log('Log filter changed to: ' + logFilter.value);
         updateLogDisplay();
       };
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
@@ -392,12 +428,15 @@
           const zip = new JSZip();
           const unzipped = await zip.loadAsync(bytes);
           const file = unzipped.file(originalName);
-          if (!file) throw new Error('File not found in zip: ' + originalName);
+          if (!file) {
+            log(`File ${originalName} not found in ZIP, treating as raw file`);
+            return new Blob([bytes], { type: 'application/octet-stream' });
+          }
           const blob = await file.async('blob');
           return new Blob([blob], { type: 'application/octet-stream' });
         } catch (e) {
-          log('Unzip file error: ' + e.message);
-          throw e;
+          log('Unzip attempt failed: ' + e.message + ', treating as raw file');
+          return new Blob([bytes], { type: 'application/octet-stream' });
         }
       }
       function connect() {
@@ -573,7 +612,7 @@
                 throw new Error(`Final hash mismatch: expected ${rx.hash}, got ${finalHash}`);
               }
               const blob = await unzipFile(rx.buf, rx.originalName);
-              log(`Unzipped file ${rx.originalName} size=${blob.size}`);
+              log(`Downloaded file ${rx.originalName} size=${blob.size}`);
               const a = document.createElement('a');
               a.href = URL.createObjectURL(blob);
               a.download = rx.originalName;
