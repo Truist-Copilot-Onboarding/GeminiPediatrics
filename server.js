@@ -11,9 +11,9 @@ const path = require('path');
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
-  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
-  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 64 * 1024, // CHANGE: 64 KiB chunks for faster transfer
+  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.zip', // CHANGE: Updated to zip
+  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'), // CHANGE: Updated to zip
+  CHUNK_SIZE: 64 * 1024, // 64 KiB chunks for fast transfer
 };
 
 // Central log bus → broadcasts to SSE clients
@@ -35,7 +35,7 @@ app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff')
 // Health
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-// Direct PDF (inline preview for troubleshooting)
+// Direct ZIP download (inline preview for troubleshooting)
 let PDF_BUFFER = null;
 async function loadPdfBufferOnce() {
   try {
@@ -47,19 +47,18 @@ async function loadPdfBufferOnce() {
     log(`File not found at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
   }
 }
-app.get('/HelloWorld.exe', async (_req, res) => {
+app.get('/HelloWorld.zip', async (_req, res) => { // CHANGE: Updated to zip
   if (!PDF_BUFFER) await loadPdfBufferOnce();
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/vnd.microsoft.portable-executable')
+    .setHeader('Content-Type', 'application/zip') // CHANGE: Updated MIME type
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
 
 // Root tester
 app.get('/', (_req, res) => {
-  // CHANGE: Serve index.html to avoid template string issues
   res.sendFile(path.join(__dirname, 'index.html'), (err) => {
     if (err) {
       log('ERROR sending index.html:', err?.message || err);
@@ -244,7 +243,7 @@ function attachTunnelWSS(server) {
           try { 
             streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE); 
           } catch (e) { 
-            safeSend(ws, { type: 'error', message: 'PDF stream failed: ' + (e?.message || e) }); 
+            safeSend(ws, { type: 'error', message: 'ZIP stream failed: ' + (e?.message || e) }); // CHANGE: Updated error message
           }
         } else {
           safeSend(ws, { type: 'error', message: 'No file configured on server. Upload to ' + CONFIG.PDF_PATH + ' or set PDF_PATH.' });
@@ -270,7 +269,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/vnd.microsoft.portable-executable', size, chunkSize, chunks });
+  safeSend(ws, { type: 'fileMeta', name, mime: 'application/zip', size, chunkSize, chunks }); // CHANGE: Updated MIME type
   log('TUNNEL sent fileMeta');
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
@@ -293,7 +292,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 50)); // CHANGE: 50ms delay
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
   safeSend(ws, { type: 'fileEnd', name, ok: true });
   log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms`);
