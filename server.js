@@ -52,7 +52,7 @@ app.get('/files', async (_req, res) => {
     const files = await fsp.readdir(CONFIG.FILES_DIR);
     const fileDetails = await Promise.all(files.map(async (file) => {
       const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
-      if (stats.size > 0) { // Only list non-empty files
+      if (stats.size > 0) {
         return { name: file, size: stats.size, mime: getMimeType(file) };
       }
       return null;
@@ -197,6 +197,7 @@ const server = http.createServer(app);
 
 // WebSocket server
 const wss = new WebSocketServer({ server, perMessageDeflate: false });
+
 wss.on('connection', (ws, req) => {
   const s = ws._socket;
   try { 
@@ -215,7 +216,7 @@ wss.on('connection', (ws, req) => {
   const clientId = Math.random().toString(36).slice(2);
   log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-  const transfers = new Map(); // Track uploads and downloads
+  const transfers = new Map();
 
   try {
     log('TUNNEL socket state before send: readyState=' + s.readyState);
@@ -348,17 +349,6 @@ wss.on('connection', (ws, req) => {
     log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`);
     transfers.clear();
   });
-});
-
-// Echo WebSocket
-const wssEcho = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
-wssEcho.on('connection', (ws, req) => {
-  attachRawSocketLogs(ws, 'ECHO');
-  const ip = req.socket.remoteAddress;
-  const origin = req.headers.origin || '(null)';
-  log(`ECHO connected ip=${ip} origin=${origin}`);
-  try { ws.send(JSON.stringify({ type: 'hello', app: CONFIG.APP_NAME })); } catch {}
-  setTimeout(() => { try { ws.close(1000, 'bye'); } catch {} }, 200);
 });
 
 function attachRawSocketLogs(ws, label) {

@@ -33,10 +33,10 @@
       min-height: 100vh;
     }
     .left-column {
-      flex: 0 0 300px; /* Fixed width for left column */
+      flex: 0 0 300px;
     }
     .right-column {
-      flex: 1; /* Takes up remaining space */
+      flex: 1;
       min-width: 300px;
     }
     @media (max-width: 800px) {
@@ -111,7 +111,7 @@
       color: #0f0;
       padding: 1rem;
       border-radius: 5px;
-      max-height: 80vh; /* Most of screen height */
+      max-height: 80vh;
       overflow: auto;
       font-family: ui-monospace, monospace;
       font-size: 0.9rem;
@@ -297,7 +297,7 @@
           const files = await res.json();
           fileSelect.innerHTML = '<option value="">Select a file...</option>';
           files.forEach(file => {
-            if (file.size > 0) { // Only list non-empty files
+            if (file.size > 0) {
               const opt = document.createElement('option');
               opt.value = file.name;
               opt.textContent = `${file.name} (${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'})`;
@@ -334,7 +334,8 @@
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
         try {
-          ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
+          ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false });
+          log('WebSocket created: ' + url);
         } catch (e) {
           log('WebSocket creation failed: ' + e.message);
           status.innerHTML = '<span class="bad">ERROR</span> - Check logs or network';
@@ -413,7 +414,7 @@
           if (m.type === 'readyForUpload') {
             log('READY for upload id=' + m.id);
             if (tx && tx.id === m.id) {
-              tx.ready = true; // Mark upload as ready
+              tx.ready = true;
             }
             return;
           }
@@ -642,7 +643,6 @@
             reader.readAsArrayBuffer(slice);
           });
         };
-        // Wait for readyForUpload before sending chunks
         const waitForReady = setInterval(() => {
           if (tx && tx.ready) {
             clearInterval(waitForReady);
