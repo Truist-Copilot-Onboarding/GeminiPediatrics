@@ -1,3 +1,462 @@
+// server.js — Heroku-compatible WS tunnel + live console + user-triggered download/upload/delete (CommonJS)
+
+const http = require('http');
+const express = require('express');
+const { WebSocketServer } = require('ws');
+const EventEmitter = require('events');
+const fs = require('fs');
+const fsp = require('fs').promises;
+const path = require('path');
+const crypto = require('crypto');
+const AdmZip = require('adm-zip');
+
+const CONFIG = {
+  PORT: process.env.PORT ? Number(process.env.PORT) : 80,
+  APP_NAME: process.env.APP_NAME || 'ws-tunnel',
+  FILES_DIR: process.env.FILES_DIR || path.join(__dirname, 'files'),
+  CHUNK_SIZE: 64 * 1024,
+  MAX_LOG_LINES: 5000, // Increased for longer history
+  MAX_FILE_SIZE: 10 * 1024 * 1024 // 10MB limit
+};
+
+// Ensure files directory exists
+if (!fs.existsSync(CONFIG.FILES_DIR)) {
+  fs.mkdirSync(CONFIG.FILES_DIR, { recursive: true });
+  log(`Created files directory at ${CONFIG.FILES_DIR}`);
+}
+
+// Central log bus → broadcasts to SSE clients
+const bus = new EventEmitter();
+const logLines = [];
+function log(...a) {
+  const line = `${new Date().toISOString()} - ${a.map(v => (typeof v === 'string' ? v : JSON.stringify(v))).join(' ')}`;
+  console.log(line);
+  logLines.push(line);
+  if (logLines.length > CONFIG.MAX_LOG_LINES) logLines.shift();
+  bus.emit('line', line);
+}
+
+// Catch hidden crashes
+process.on('uncaughtException', (e) => log('UNCAUGHT', e?.stack || e?.message || String(e)));
+process.on('unhandledRejection', (e) => log('UNHANDLED_REJECTION', e?.stack || e?.message || String(e)));
+
+// Basic authentication middleware
+function basicAuth(req, res, next) {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    log(`AUTH failed: No authorization header from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.setHeader('WWW-Authenticate', 'Basic realm="Restricted Area"');
+    return res.status(401).type('text').send('Authentication required');
+  }
+  const auth = Buffer.from(authHeader.replace('Basic ', ''), 'base64').toString().split(':');
+  const username = auth[0];
+  const password = auth[1];
+  if (username === 'womprats' && password === 'womprats') {
+    log(`AUTH success: User womprats authenticated from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return next();
+  }
+  log(`AUTH failed: Invalid credentials from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.setHeader('WWW-Authenticate', 'Basic realm="Restricted Area"');
+  return res.status(401).type('text').send('Invalid credentials');
+}
+
+const app = express();
+app.set('trust proxy', true);
+app.use((req, res, next) => { 
+  res.setHeader('X-Content-Type-Options', 'nosniff'); 
+  next(); 
+});
+
+// Health
+app.get('/healthz', (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`HEALTH check from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.type('text').send('ok');
+});
+
+// File list page (basic auth protected)
+app.get('/files', basicAuth, async (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`FILES request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  try {
+    const files = await fsp.readdir(CONFIG.FILES_DIR);
+    const fileDetails = await Promise.all(files.map(async (file) => {
+      const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
+      if (stats.size > 0) {
+        return {
+          name: file,
+          size: stats.size,
+          modified: stats.mtime.toISOString(),
+          mime: getMimeType(file)
+        };
+      }
+      return null;
+    }));
+    const filteredFiles = fileDetails.filter(f => f);
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Index of /files</title>
+        <style>
+          :root { 
+            color-scheme: light dark; 
+            --primary: #1e90ff;
+            --bg: #f8f9fa;
+            --card-bg: #fff;
+            --text: #333;
+            --muted: #6c757d;
+          }
+          @media (prefers-color-scheme: dark) {
+            :root {
+              --bg: #222;
+              --card-bg: #333;
+              --text: #fff;
+              --muted: #aaa;
+            }
+          }
+          body {
+            font-family: system-ui, -apple-system, sans-serif;
+            padding: 1rem;
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+          }
+          h1 {
+            font-size: 1.8rem;
+            margin-bottom: 1rem;
+            color: var(--primary);
+          }
+          .muted { color: var(--muted); }
+          .card {
+            background: var(--card-bg);
+            border: 1px solid #ccc3;
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+          }
+          th, td {
+            border: 1px solid #ccc;
+            padding: 0.5rem;
+            text-align: left;
+          }
+          th {
+            background: var(--card-bg);
+          }
+          a { color: var(--primary); text-decoration: none; }
+          a:hover { text-decoration: underline; }
+        </style>
+      </head>
+      <body>
+        <h1>Index of /files</h1>
+        <p class="muted"><a href="/">Return to tester</a></p>
+        <div class="card">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Modified</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filteredFiles.length ? filteredFiles.map(file => `
+                <tr>
+                  <td><a href="/files/${encodeURIComponent(file.name)}">${file.name}</a></td>
+                  <td>${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'}</td>
+                  <td>${file.modified}</td>
+                </tr>
+              `).join('') : '<tr><td colspan="3">No files available</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </body>
+      </html>
+    `;
+    res.status(200).type('html').send(html);
+  } catch (e) {
+    log(`ERROR listing files from ip=${ip} ua="${ua}" referrer="${referrer}":`, e?.message || e);
+    res.status(500).type('text').send('Failed to list files');
+  }
+});
+
+// Direct file download (basic auth protected)
+let FILE_CACHE = new Map();
+async function loadFileBuffer(fileName) {
+  const filePath = path.join(CONFIG.FILES_DIR, fileName);
+  try {
+    const buffer = await fsp.readFile(filePath);
+    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    let isValidZip = false;
+    try {
+      const zip = new AdmZip(buffer);
+      zip.getEntries(); // Test if valid ZIP
+      isValidZip = true;
+    } catch (e) {
+      log(`File ${fileName} is not a valid ZIP: ${e.message}`);
+    }
+    FILE_CACHE.set(fileName, { buffer, hash, isValidZip });
+    log(`File loaded bytes=${buffer.length} hash=${hash} isValidZip=${isValidZip} from ${filePath} (name=${fileName}, mime=${getMimeType(fileName)})`);
+    return { buffer, hash, isValidZip };
+  } catch (e) {
+    log(`File not found at ${filePath}: ${e.message}`);
+    return null;
+  }
+}
+app.get('/files/:fileName', basicAuth, async (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const fileName = sanitizeFileName(req.params.fileName);
+  log(`FILE download request for ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+  if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+    log(`Invalid file path: ${filePath} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(403).type('text').send('Invalid file path.');
+  }
+  let file = FILE_CACHE.get(fileName);
+  if (!file) file = await loadFileBuffer(fileName);
+  if (!file) return res.status(404).type('text').send('File not found.');
+  let finalBuffer = file.buffer;
+  let finalMime = getMimeType(fileName);
+  if (!file.isValidZip && finalMime !== 'application/zip') {
+    log(`Wrapping non-ZIP file ${fileName} in ZIP for direct download from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    const zip = new AdmZip();
+    zip.addFile(fileName, file.buffer);
+    finalBuffer = zip.toBuffer();
+    finalMime = 'application/zip';
+  }
+  res
+    .status(200)
+    .setHeader('Content-Type', finalMime)
+    .setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
+    .send(finalBuffer);
+});
+
+// Delete file
+app.delete('/files/:fileName', async (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const fileName = sanitizeFileName(req.params.fileName);
+  log(`DELETE request for ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+  if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+    log(`Invalid delete path: ${filePath} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(403).type('text').send('Invalid file path.');
+  }
+  try {
+    await fsp.unlink(filePath);
+    FILE_CACHE.delete(fileName);
+    log(`File deleted: ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.status(200).type('text').send('File deleted.');
+  } catch (e) {
+    log(`ERROR deleting file ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}":`, e?.message || e);
+    res.status(404).type('text').send('File not found or cannot be deleted.');
+  }
+});
+
+// Root tester (client interface) with basic auth
+app.get('/', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`ROOT request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.sendFile(path.join(__dirname, 'index.html'), (err) => {
+    if (err) {
+      log(`ERROR sending index.html from ip=${ip} ua="${ua}" referrer="${referrer}":`, err?.message || err);
+      res.status(500).type('text').send('Failed to load page');
+    }
+  });
+});
+
+// Console (SSE) with basic auth
+app.get('/console', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`CONSOLE request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.sendFile(path.join(__dirname, 'console.html'), (err) => {
+    if (err) {
+      log(`ERROR sending console.html from ip=${ip} ua="${ua}" referrer="${referrer}":`, err?.message || err);
+      res.status(500).type('text').send('Failed to load console page');
+    }
+  });
+});
+
+app.get('/logs', (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`LOGS SSE connected from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Keep-Alive', 'timeout=30');
+  res.flushHeaders?.();
+  const send = (line) => {
+    try {
+      res.write(`data: ${line}\n\n`);
+    } catch (e) {
+      log(`SSE send error from ip=${ip} ua="${ua}" referrer="${referrer}": ${e.message}`);
+    }
+  };
+  const onLine = (line) => send(line);
+  logLines.forEach(line => send(line));
+  bus.on('line', onLine);
+  send(`${new Date().toISOString()} - [SSE] connected from ip=${ip}`);
+  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 10000);
+  req.on('close', () => { 
+    log(`LOGS SSE closed from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    clearInterval(iv); 
+    bus.off('line', onLine); 
+    res.end();
+  });
+});
+
+// Console client management endpoints
+const connectedClients = new Map();
+const blacklistedIps = new Set();
+app.get('/console/clients', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`CLIENTS request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  const clients = Array.from(connectedClients.values()).map(client => ({
+    ip: client.ip,
+    clientId: client.clientId,
+    connectedAt: client.connectedAt,
+    userAgent: client.userAgent,
+    referrer: client.referrer
+  }));
+  res.status(200).json(clients);
+});
+app.get('/console/blacklist', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`BLACKLIST request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.status(200).json(Array.from(blacklistedIps));
+});
+app.post('/console/kill', basicAuth, express.json(), (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const { clientId } = req.body;
+  log(`KILL client request for clientId=${clientId} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  const client = connectedClients.get(clientId);
+  if (!client) {
+    log(`KILL client failed: clientId=${clientId} not found from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(404).type('text').send('Client not found');
+  }
+  try {
+    client.ws.close(1000, 'Killed by admin');
+    connectedClients.delete(clientId);
+    log(`KILL client succeeded: clientId=${clientId} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.status(200).type('text').send('Client connection terminated');
+  } catch (e) {
+    log(`KILL client error for clientId=${clientId} from ip=${ip} ua="${ua}" referrer="${referrer}": ${e.message}`);
+    res.status(500).type('text').send('Failed to kill client');
+  }
+});
+app.post('/console/blacklist', basicAuth, express.json(), (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const { ip: targetIp } = req.body;
+  log(`BLACKLIST IP request for ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  if (!targetIp) {
+    log(`BLACKLIST IP failed: No IP provided from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(400).type('text').send('IP address required');
+  }
+  blacklistedIps.add(targetIp);
+  // Terminate existing connections from this IP
+  for (const [clientId, client] of connectedClients) {
+    if (client.ip === targetIp) {
+      try {
+        client.ws.close(1000, 'Blacklisted by admin');
+        connectedClients.delete(clientId);
+        log(`Terminated clientId=${clientId} due to blacklist ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+      } catch (e) {
+        log(`Error terminating clientId=${clientId} for blacklist ip=${targetIp}: ${e.message}`);
+      }
+    }
+  }
+  log(`BLACKLIST IP succeeded: ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.status(200).type('text').send(`IP ${targetIp} blacklisted`);
+});
+app.post('/console/unblacklist', basicAuth, express.json(), (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const { ip: targetIp } = req.body;
+  log(`UNBLACKLIST IP request for ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  if (!targetIp) {
+    log(`UNBLACKLIST IP failed: No IP provided from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(400).type('text').send('IP address required');
+  }
+  if (blacklistedIps.delete(targetIp)) {
+    log(`UNBLACKLIST IP succeeded: ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.status(200).type('text').send(`IP ${targetIp} unblacklisted`);
+  } else {
+    log(`UNBLACKLIST IP failed: ip=${targetIp} not found in blacklist from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.status(404).type('text').send(`IP ${targetIp} not found in blacklist`);
+  }
+});
+
+// HTTP server
+const server = http.createServer(app);
+
+// WebSocket server
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
+
+wss.on('headers', (headers, req) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
+  headers.push('Sec-WebSocket-Extensions: none');
+  log(`HEADERS ws-tunnel from ip=${ip} ua="${ua}" referrer="${referrer}"`, JSON.stringify(headers));
+});
+
+wss.on('connection', (ws, req) => {
+  const s = ws._socket;
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  // Check if IP is blacklisted
+  if (blacklistedIps.has(ip)) {
+    log(`TUNNEL connection rejected: ip=${ip} is blacklisted ua="${ua}" referrer="${referrer}"`);
+    ws.close(1000, 'IP blacklisted');
+    return;
+  }
+  try { 
+    s.setNoDelay(true); 
+    s.setKeepAlive(true, 500);
+    log(`TUNNEL socket options set: noDelay=true, keepAlive=500ms from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  } catch (e) {
+    log(`TUNNEL socket options error from ip=${ip} ua="${ua}" referrer="${referrer}"`, e?.message || e);
+  }
+
+  attachRawSocketLogs(ws, 'TUNNEL', ip, ua, referrer);
+
+  const origin = req.headers.origin || '(null)';
+  const clientId = Math.random().toString(36).slice(2);
+  const transfers = new Map();
   connectedClients.set(clientId, { ws, ip, clientId, connectedAt: Date.now(), userAgent: ua, referrer });
   log(`TUNNEL connected ip=${ip} ua="${ua}" referrer="${referrer}" origin=${origin} id=${clientId}`);
 
