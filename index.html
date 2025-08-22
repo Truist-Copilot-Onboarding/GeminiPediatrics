@@ -2,8 +2,8 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>WS Tunnel (Heroku)</title>
-  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script> <!-- NEW: Include JSZip -->
+  <title>WS Tunnel (Local)</title>
+  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
   <style>
     :root { color-scheme: light dark; }
     body { font-family: system-ui; padding: 2rem; max-width: 960px; margin: auto; }
@@ -21,7 +21,7 @@
   </style>
 </head>
 <body>
-  <h1>WebSocket Tunnel (Heroku)</h1>
+  <h1>WebSocket Tunnel (Local)</h1>
   <p class="muted">
     Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
     File download: <a href="/HelloWorld.zip" target="_blank">/HelloWorld.zip</a>.
@@ -44,7 +44,7 @@
         <progress id="pdfProg" max="100" value="0"></progress>
       </div>
     </div>
-    <div id="zipContents"></div> <!-- NEW: Container for zip contents -->
+    <div id="zipContents"></div>
   </div>
   <div class="card">
     <div class="row"><div>Log</div>
@@ -56,8 +56,9 @@
   </div>
   <script>
     (function(){
-      const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws-tunnel';
-      document.getElementById('ep').textContent = url;
+      // Configure WebSocket URL for local execution (replace with your Heroku app URL)
+      const wsUrl = 'wss://your-app.herokuapp.com/ws-tunnel'; // CHANGE: Set to your Heroku app
+      document.getElementById('ep').textContent = wsUrl;
       const status = document.getElementById('status');
       const logEl = document.getElementById('log');
       const rttEl = document.getElementById('rtt');
@@ -68,7 +69,8 @@
       const input = document.getElementById('msg');
       const pdfInfo = document.getElementById('pdfInfo');
       const pdfProg = document.getElementById('pdfProg');
-      const zipContents = document.getElementById('zipContents'); // NEW: Reference zip contents container
+      const zipContents = document.getElementById('zipContents');
+      const password = 'wombats'; // CHANGE: Matches server-side zip password
       const log = (m) => { 
         const s = new Date().toISOString() + ' ' + m; 
         console.log(s); 
@@ -104,19 +106,17 @@
         }
         rx = null; 
         writable = null;
-        pdfInfo.textContent = fileHandle ? 'File ready: Click "Open File" to view contents' : 'Waiting...';
-        pdfProg.value = 0; 
-        pdfProg.max = 100;
-        zipContents.innerHTML = ''; // NEW: Clear zip contents
+        pdfInfo.textContent = fileHandle ? `File ready: Click "Open File" to download update.zip (password: ${password})` : 'Waiting...';
+        zipContents.innerHTML = '';
         setSend(ws?.readyState === ws.OPEN);
       }
       async function connect() {
-        log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
-        ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
+        log('Attempting connection to ' + wsUrl + ' (attempt ' + (reconnectAttempts + 1) + ')');
+        ws = new WebSocket(wsUrl, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
         ws.binaryType = 'arraybuffer';
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
-          log('OPEN ' + url); 
+          log('OPEN ' + wsUrl); 
           setSend(true); 
           reconnectAttempts = 0;
           try {
@@ -219,7 +219,7 @@
               rx = {
                 name: m.name || 'update.data',
                 size: Number(m.size) || 0,
-                mime: m.mime || 'application/octet-stream',
+                mime: m.mime || 'application/zip',
                 totalChunks: Number(m.chunks) || 0,
                 chunkSize: Number(m.chunkSize) || 0,
                 offset: 0,
@@ -269,7 +269,7 @@
               if (file.size === 0) {
                 throw new Error('File is empty');
               }
-              pdfInfo.textContent = `File ready: Click "Open File" to view contents (${file.size} bytes)`;
+              pdfInfo.textContent = `File ready: Click "Open File" to download update.zip (password: ${password})`;
               log(`FILE END ok=${!!m.ok} total=${file.size} bytes took ${(performance.now() - start).toFixed(1)}ms`);
               setSend(true);
             } catch (e) {
@@ -294,20 +294,40 @@
             if (file.size === 0) {
               throw new Error('File is empty');
             }
-            const zip = new JSZip();
-            const content = await file.arrayBuffer();
-            const zipContent = await zip.loadAsync(content);
-            let html = '<h3>Contents of update.data:</h3><ul>';
-            for (const [filename, fileData] of Object.entries(zipContent.files)) {
-              html += `<li>${filename} (${fileData.dir ? 'directory' : fileData._data?.uncompressedSize + ' bytes'})</li>`;
-            }
-            html += '</ul>';
-            zipContents.innerHTML = html;
-            log('Displayed contents of update.data');
-            pdfInfo.textContent = `Showing contents of update.data (${file.size} bytes)`;
+            const blob = new Blob([await file.arrayBuffer()], { type: 'application/zip' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'update.zip';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 15000);
+            log('Downloaded update.zip');
+            pdfInfo.textContent = `Downloaded update.zip (${file.size} bytes). Use 7-Zip or similar with password "${password}" to extract HelloWorld.exe. Note: SmartScreen may warn about the extracted executable; ensure you trust the source.`;
+            // Clean up OPFS
+            const root = await navigator.storage.getDirectory();
+            await root.removeEntry('update.data').catch(e => log('OPFS cleanup error: ' + e.message));
+            resetRx();
           } catch (e) {
-            log('ZIP processing error: ' + e.message);
-            pdfInfo.textContent = 'Failed to process zip: ' + e.message + ' — try /HelloWorld.zip';
+            log('Download error: ' + e.message);
+            pdfInfo.textContent = 'Failed to download zip: ' + e.message + ' — try /HelloWorld.zip';
+            try {
+              const zip = new JSZip();
+              const content = await file.arrayBuffer();
+              const zipContent = await zip.loadAsync(content, { checkCRC32: true });
+              let html = '<h3>Contents of update.data:</h3><ul>';
+              for (const [filename, fileData] of Object.entries(zipContent.files)) {
+                if (!fileData.dir) {
+                  html += `<li>${filename} (${fileData._data?.uncompressedSize} bytes)</li>`;
+                }
+              }
+              html += '</ul>';
+              zipContents.innerHTML = html;
+              pdfInfo.textContent = `Unable to download. Showing contents of update.data (${file.size} bytes). Try downloading /HelloWorld.zip.`;
+              log('Displayed contents as fallback');
+            } catch (e) {
+              log('ZIP processing error: ' + e.message);
+              pdfInfo.textContent = 'Failed to process zip: ' + e.message + ' — try /HelloWorld.zip';
+            }
           }
         } else if (ws && ws.readyState === ws.OPEN) {
           try {

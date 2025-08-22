@@ -1,4 +1,4 @@
-// server.js — Heroku-compatible WS tunnel + live console + user-triggered download (CommonJS)
+// server.js — Heroku-compatible WS tunnel + live console + encrypted zip streaming (CommonJS)
 
 const http = require('http');
 const express = require('express');
@@ -7,7 +7,7 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
-const AdmZip = require('adm-zip'); // NEW: For zip validation
+const AdmZip = require('adm-zip');
 
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
@@ -16,6 +16,7 @@ const CONFIG = {
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'),
   CHUNK_SIZE: 64 * 1024,
   CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20,
+  ZIP_PASSWORD: 'wombats', // NEW: Password for encrypted zip
 };
 
 const bus = new EventEmitter();
@@ -39,16 +40,28 @@ async function loadPdfBufferOnce() {
   try {
     const stats = await fsp.stat(CONFIG.PDF_PATH);
     if (!stats.isFile() || stats.size === 0) throw new Error('Not a valid file');
-    // NEW: Validate zip file
     try {
+      // NEW: Validate zip and check for password encryption
       const zip = new AdmZip(CONFIG.PDF_PATH);
-      zip.getEntries(); // Throws if zip is invalid
+      try {
+        zip.getEntries(); // Try without password
+        throw new Error('Zip is not password-protected');
+      } catch (e) {
+        if (e.message.includes('password')) {
+          // Verify password 'wombats'
+          const zipWithPassword = new AdmZip(CONFIG.PDF_PATH);
+          zipWithPassword.getEntries({ password: CONFIG.ZIP_PASSWORD });
+          log('Zip is password-protected with correct password');
+        } else {
+          throw new Error('Invalid zip file: ' + e.message);
+        }
+      }
+      const b = await fsp.readFile(CONFIG.PDF_PATH);
+      PDF_BUFFER = b;
+      log(`File loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
     } catch (e) {
-      throw new Error('Invalid zip file: ' + e.message);
+      throw new Error('Zip validation failed: ' + e.message);
     }
-    const b = await fsp.readFile(CONFIG.PDF_PATH);
-    PDF_BUFFER = b;
-    log(`File loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
   } catch (e) {
     PDF_BUFFER = null;
     log(`File not found or invalid at ${CONFIG.PDF_PATH}: ${e.message} — WS download will be skipped.`);
@@ -227,7 +240,7 @@ function attachTunnelWSS(server) {
       log('TUNNEL sent heartbeat ping');
     }, 500);
 
-    let streamPaused = false; // NEW: Track streaming state
+    let streamPaused = false;
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
       let m = null;
@@ -266,13 +279,13 @@ function attachTunnelWSS(server) {
       }
       if (m.type === 'ready') {
         log('TUNNEL received client ready id=' + m.id);
-        streamPaused = false; // NEW: Resume streaming
+        streamPaused = false;
         return;
       }
       if (m.type === 'error') {
         log('TUNNEL received client error: ' + m.message);
         if (m.message.includes('quota') || m.message.includes('OPFS')) {
-          streamPaused = true; // NEW: Pause streaming on critical errors
+          streamPaused = true;
         }
         return;
       }
@@ -295,7 +308,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize, requestId) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, downloadName: 'update.data', mime: 'application/zip', size, chunkSize, chunks, requestId }); // CHANGED: MIME type to application/zip
+  safeSend(ws, { type: 'fileMeta', name, downloadName: 'update.zip', mime: 'application/zip', size, chunkSize, chunks, requestId });
   log('TUNNEL sent fileMeta for requestId=' + requestId);
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
