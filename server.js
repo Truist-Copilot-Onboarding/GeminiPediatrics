@@ -11,9 +11,10 @@ const path = require('path');
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
-  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.zip',
-  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'),
-  CHUNK_SIZE: 64 * 1024, // CHANGE: 64 KiB chunks for faster transfer
+  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
+  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
+  CHUNK_SIZE: 64 * 1024, // 64 KiB chunks for faster transfer
+  CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20, // CHANGE: Configurable delay, reduced to 20ms
 };
 
 // Central log bus → broadcasts to SSE clients
@@ -39,27 +40,28 @@ app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 let PDF_BUFFER = null;
 async function loadPdfBufferOnce() {
   try {
+    const stats = await fsp.stat(CONFIG.PDF_PATH); // CHANGE: Check file existence
+    if (!stats.isFile()) throw new Error('Not a file');
     const b = await fsp.readFile(CONFIG.PDF_PATH);
     PDF_BUFFER = b;
     log(`File loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
   } catch (e) {
     PDF_BUFFER = null;
-    log(`File not found at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
+    log(`File not found or invalid at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
   }
 }
-app.get('/HelloWorld.zip', async (_req, res) => {
+app.get('/HelloWorld.exe', async (_req, res) => {
   if (!PDF_BUFFER) await loadPdfBufferOnce();
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/zip')
+    .setHeader('Content-Type', 'application/vnd.microsoft.portable-executable')
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
 
 // Root tester
 app.get('/', (_req, res) => {
-  // CHANGE: Serve index.html to avoid template string issues
   res.sendFile(path.join(__dirname, 'index.html'), (err) => {
     if (err) {
       log('ERROR sending index.html:', err?.message || err);
@@ -232,13 +234,16 @@ function attachTunnelWSS(server) {
       try { 
         m = JSON.parse(data.toString('utf8')); 
       } catch {
-        return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
+        return safeSend(ws, { type: 'error', message: 'Invalid JSON' });
       }
-      if (m?.type === 'ping') {
+      if (!m?.type) {
+        return safeSend(ws, { type: 'error', message: 'Missing message type' });
+      }
+      if (m.type === 'ping') {
         log('TUNNEL received client ping id=' + m.id);
         return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
       }
-      if (m?.type === 'requestFile') {
+      if (m.type === 'requestFile') {
         log('TUNNEL received file request id=' + m.id);
         if (PDF_BUFFER && ws.readyState === ws.OPEN) {
           try { 
@@ -251,10 +256,14 @@ function attachTunnelWSS(server) {
         }
         return;
       }
-      if (m?.type === 'say') {
+      if (m.type === 'ready') {
+        log('TUNNEL received client ready id=' + m.id);
+        return;
+      }
+      if (m.type === 'say') {
         return safeSend(ws, { type: 'say', echo: m.text ?? '', serverTs: Date.now() });
       }
-      safeSend(ws, { type: 'error', message: 'Unsupported message type' });
+      safeSend(ws, { type: 'error', message: 'Unsupported message type: ' + m.type });
     });
 
     ws.on('error', (err) => { log('TUNNEL error:', err?.message || err); });
@@ -270,7 +279,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/zip', size, chunkSize, chunks });
+  safeSend(ws, { type: 'fileMeta', name, mime: 'application/vnd.microsoft.portable-executable', size, chunkSize, chunks });
   log('TUNNEL sent fileMeta');
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
@@ -281,10 +290,9 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
     const start = i * chunkSize;
     const end = Math.min(size, start + chunkSize);
     const slice = buffer.subarray(start, end);
-    const b64 = slice.toString('base64');
     try {
       await new Promise((resolve, reject) => {
-        ws.send(JSON.stringify({ type: 'fileChunk', seq: i, data: b64 }), (err) => err ? reject(err) : resolve());
+        ws.send(slice, { binary: true }, (err) => err ? reject(err) : resolve()); // CHANGE: Send binary data
       });
       if ((i % 16) === 0 || i === chunks - 1) {
         log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} took ${(performance.now() - chunkStart).toFixed(1)}ms`);
@@ -293,7 +301,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 50)); // CHANGE: 50ms delay
+    await new Promise(resolve => setTimeout(resolve, CONFIG.CHUNK_DELAY_MS)); // CHANGE: Use configurable delay
   }
   safeSend(ws, { type: 'fileEnd', name, ok: true });
   log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms`);
