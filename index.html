@@ -1,679 +1,519 @@
-<!DOCTYPE html>
+// server.js — Heroku-compatible WS tunnel + live console + user-triggered download/upload/delete (CommonJS)
+
+const http = require('http');
+const express = require('express');
+const { WebSocketServer } = require('ws');
+const EventEmitter = require('events');
+const fs = require('fs');
+const fsp = require('fs').promises;
+const path = require('path');
+const crypto = require('crypto');
+
+const CONFIG = {
+  PORT: process.env.PORT ? Number(process.env.PORT) : 80,
+  APP_NAME: process.env.APP_NAME || 'ws-tunnel',
+  FILES_DIR: process.env.FILES_DIR || path.join(__dirname, 'files'),
+  CHUNK_SIZE: 64 * 1024,
+  MAX_LOG_LINES: 100,
+  MAX_FILE_SIZE: 10 * 1024 * 1024 // 10MB limit
+};
+
+// Ensure files directory exists
+if (!fs.existsSync(CONFIG.FILES_DIR)) {
+  fs.mkdirSync(CONFIG.FILES_DIR, { recursive: true });
+  log(`Created files directory at ${CONFIG.FILES_DIR}`);
+}
+
+// Central log bus → broadcasts to SSE clients
+const bus = new EventEmitter();
+const logLines = [];
+function log(...a) {
+  const line = `${new Date().toISOString()} - ${a.map(v => (typeof v === 'string' ? v : JSON.stringify(v))).join(' ')}`;
+  console.log(line);
+  logLines.push(line);
+  if (logLines.length > CONFIG.MAX_LOG_LINES) logLines.shift();
+  bus.emit('line', line);
+}
+
+// Catch hidden crashes
+process.on('uncaughtException', (e) => log('UNCAUGHT', e?.stack || e?.message || String(e)));
+process.on('unhandledRejection', (e) => log('UNHANDLED_REJECTION', e?.stack || e?.message || String(e)));
+
+const app = express();
+app.set('trust proxy', true);
+app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
+
+// Health
+app.get('/healthz', (_req, res) => res.type('text').send('ok'));
+
+// List files in files directory
+app.get('/files', async (_req, res) => {
+  try {
+    const files = await fsp.readdir(CONFIG.FILES_DIR);
+    const fileDetails = await Promise.all(files.map(async (file) => {
+      const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
+      if (stats.size > 0) { // Only list non-empty files
+        return { name: file, size: stats.size, mime: getMimeType(file) };
+      }
+      return null;
+    }));
+    res.status(200).json(fileDetails.filter(f => f));
+  } catch (e) {
+    log('ERROR listing files:', e?.message || e);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+// Direct file download
+let FILE_CACHE = new Map();
+async function loadFileBuffer(fileName) {
+  const filePath = path.join(CONFIG.FILES_DIR, fileName);
+  try {
+    const buffer = await fsp.readFile(filePath);
+    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    FILE_CACHE.set(fileName, { buffer, hash });
+    log(`File loaded bytes=${buffer.length} hash=${hash} from ${filePath} (name=${fileName}, mime=${getMimeType(fileName)})`);
+    return { buffer, hash };
+  } catch (e) {
+    log(`File not found at ${filePath}: ${e.message}`);
+    return null;
+  }
+}
+app.get('/files/:fileName', async (req, res) => {
+  const fileName = sanitizeFileName(req.params.fileName);
+  const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+  if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+    log(`Invalid file path: ${filePath}`);
+    return res.status(403).type('text').send('Invalid file path.');
+  }
+  let file = FILE_CACHE.get(fileName);
+  if (!file) file = await loadFileBuffer(fileName);
+  if (!file) return res.status(404).type('text').send('File not found.');
+  res
+    .status(200)
+    .setHeader('Content-Type', getMimeType(fileName))
+    .setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
+    .send(file.buffer);
+});
+
+// Delete file
+app.delete('/files/:fileName', async (req, res) => {
+  const fileName = sanitizeFileName(req.params.fileName);
+  const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+  if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+    log(`Invalid delete path: ${filePath}`);
+    return res.status(403).type('text').send('Invalid file path.');
+  }
+  try {
+    await fsp.unlink(filePath);
+    FILE_CACHE.delete(fileName);
+    log(`File deleted: ${fileName}`);
+    res.status(200).type('text').send('File deleted.');
+  } catch (e) {
+    log(`ERROR deleting file ${fileName}: ${e?.message || e}`);
+    res.status(404).type('text').send('File not found or cannot be deleted.');
+  }
+});
+
+// Root tester
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'), (err) => {
+    if (err) {
+      log('ERROR sending index.html:', err?.message || err);
+      res.status(500).type('text').send('Failed to load page');
+    }
+  });
+});
+
+// Console (SSE)
+app.get('/console', (_req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>WS Tunnel (Heroku)</title>
+  <title>WS Server Console</title>
   <style>
-    :root { 
-      color-scheme: light dark; 
-      --primary: #1e90ff;
-      --success: #28a745;
-      --error: #dc3545;
-      --bg: #f8f9fa;
-      --card-bg: #fff;
-      --text: #333;
-      --muted: #6c757d;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #222;
-        --card-bg: #333;
-        --text: #ddd;
-        --muted: #aaa;
-      }
-    }
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      padding: 1rem;
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      display: flex;
-      gap: 1rem;
-      min-height: 100vh;
-    }
-    .left-column {
-      flex: 0 0 300px; /* Fixed width for left column */
-    }
-    .right-column {
-      flex: 1; /* Takes up remaining space */
-      min-width: 300px;
-    }
-    @media (max-width: 800px) {
-      body {
-        flex-direction: column;
-      }
-      .left-column, .right-column {
-        flex: 1;
-      }
-    }
-    h1 {
-      font-size: 1.8rem;
-      margin-bottom: 1rem;
-      color: var(--primary);
-    }
-    .muted { color: var(--muted); }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid #ccc3;
-      border-radius: 10px;
-      padding: 1.5rem;
-      margin-bottom: 1rem;
-      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-    }
-    .row {
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-      margin-bottom: 1rem;
-    }
-    .row label {
-      width: 100px;
-      font-weight: 500;
-    }
-    .row > div { flex: 1; }
-    .controls {
-      display: flex;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-    }
-    input, select, button {
-      font: inherit;
-      padding: 0.5rem 1rem;
-      border: 1px solid #ccc;
-      border-radius: 5px;
-      background: #fff;
-      color: var(--text);
-    }
-    button {
-      background: var(--primary);
-      color: white;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-    button:hover:not(:disabled) {
-      background: #1c86ee;
-    }
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-    .delete-btn {
-      background: var(--error);
-    }
-    .delete-btn:hover:not(:disabled) {
-      background: #c82333;
-    }
-    .ok { color: var(--success); }
-    .bad { color: var(--error); }
-    pre {
-      background: #1a1a1a;
-      color: #0f0;
-      padding: 1rem;
-      border-radius: 5px;
-      max-height: 80vh; /* Most of screen height */
-      overflow: auto;
-      font-family: ui-monospace, monospace;
-      font-size: 0.9rem;
-    }
-    progress {
-      width: 100%;
-      height: 1.2rem;
-      border-radius: 5px;
-    }
-    a { color: var(--primary); text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    :root { color-scheme: light dark; }
+    body { font-family: ui-monospace, Menlo, Consolas, monospace; margin: 0; background: #0b0b0b; color: #c8facc; }
+    header { padding: 10px 14px; background: #111; border-bottom: 1px solid #222; }
+    main { padding: 10px 14px; }
+    pre { white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
-  <div class="left-column">
-    <h1>WebSocket Tunnel (Heroku)</h1>
-    <p class="muted">
-      Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
-      File download: <a href="/files/HelloWorld.zip" target="_blank">/files/HelloWorld.zip</a> (example).
-    </p>
-    <div class="card">
-      <div class="row">
-        <label>Endpoint</label>
-        <div><code id="ep"></code></div>
-      </div>
-      <div class="row">
-        <label>Status</label>
-        <div id="status">Connecting...</div>
-      </div>
-      <div class="row">
-        <label>RTT (avg)</label>
-        <div id="rtt">--</div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="row">
-        <label>Send Message</label>
-        <div class="controls">
-          <input id="msg" placeholder="Type text (or 'ping')" style="flex: 1"/>
-          <button id="send" disabled>Send</button>
-          <button id="reconnect">Reconnect</button>
-        </div>
-      </div>
-      <div class="row">
-        <label>File Operations</label>
-        <div class="controls">
-          <select id="fileSelect" disabled>
-            <option value="">Select a file...</option>
-          </select>
-          <button id="downloadBtn" disabled>Download</button>
-          <button id="deleteBtn" disabled class="delete-btn">Delete</button>
-        </div>
-      </div>
-      <div class="row">
-        <label>Upload File</label>
-        <div class="controls">
-          <input type="file" id="fileInput" disabled/>
-          <button id="uploadBtn" disabled>Upload</button>
-        </div>
-      </div>
-      <div class="row">
-        <label>Transfer Progress</label>
-        <div>
-          <div id="transferInfo" class="muted">Waiting...</div>
-          <progress id="transferProg" max="100" value="0"></progress>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="right-column">
-    <div class="card">
-      <div class="row">
-        <label>Client Logs</label>
-        <div>
-          <pre id="log"></pre>
-          <div class="controls">
-            <button id="copyLogs">Copy Logs</button>
-            <button id="pauseLogs">Pause Logs</button>
-            <label><input type="checkbox" id="filterPingPong" checked> Filter Ping/Pong</label>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
+  <header>
+    <strong>Server Console</strong> — live from /logs (SSE)
+    <span style="opacity: 0.7"> | <a href="/" style="color: #9cf">tester</a></span>
+  </header>
+  <main>
+    <pre id="out"></pre>
+    <button id="copyLogs">Copy Logs</button>
+  </main>
   <script>
-    (function(){
-      const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws-tunnel';
-      document.getElementById('ep').textContent = url;
-      const status = document.getElementById('status');
-      const logEl = document.getElementById('log');
-      const rttEl = document.getElementById('rtt');
-      const sendBtn = document.getElementById('send');
-      const reconnectBtn = document.getElementById('reconnect');
-      const copyLogsBtn = document.getElementById('copyLogs');
-      const pauseLogsBtn = document.getElementById('pauseLogs');
-      const filterPingPong = document.getElementById('filterPingPong');
-      const fileSelect = document.getElementById('fileSelect');
-      const downloadBtn = document.getElementById('downloadBtn');
-      const deleteBtn = document.getElementById('deleteBtn');
-      const fileInput = document.getElementById('fileInput');
-      const uploadBtn = document.getElementById('uploadBtn');
-      const transferInfo = document.getElementById('transferInfo');
-      const transferProg = document.getElementById('transferProg');
-      const MAX_LOG_LINES = 100;
-      let logLines = [], isPaused = false;
-      const debounce = (fn, delay) => {
-        let timeout;
-        return (...args) => {
-          if (timeout) return;
-          timeout = setTimeout(() => {
-            fn(...args);
-            timeout = null;
-          }, delay);
-        };
-      };
-      const disableDuringTransfer = (fn) => {
-        return (...args) => {
-          if (rx || tx) {
-            log('Action blocked: transfer in progress');
-            return;
-          }
-          fn(...args);
-        };
-      };
-      const log = (m) => { 
-        if (filterPingPong.checked && (m.includes('PING') || m.includes('PONG') || m.includes('serverPing'))) return;
-        const s = new Date().toISOString() + ' ' + m; 
-        console.log(s); 
-        logLines.push(s);
-        if (logLines.length > MAX_LOG_LINES) logLines.shift();
-        if (!isPaused) {
-          logEl.textContent = logLines.join('\n'); 
-          logEl.scrollTop = logEl.scrollHeight; 
-        }
-      };
-      const setSend = (on) => {
-        sendBtn.disabled = !on;
-        downloadBtn.disabled = !on || (rx || tx);
-        fileSelect.disabled = !on;
-        deleteBtn.disabled = !on || (rx || tx);
-        fileInput.disabled = !on || (rx || tx);
-        uploadBtn.disabled = !on || (rx || tx);
-      };
-      const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-      copyLogsBtn.onclick = debounce(async () => {
-        try { 
-          await navigator.clipboard.writeText(logEl.textContent); 
-          log('Logs copied to clipboard'); 
-        } catch (e) {
-          log('Copy failed: ' + e.message);
-          const t = document.createElement('textarea'); 
-          t.value = logEl.textContent; 
-          document.body.appendChild(t); 
-          t.select(); 
-          document.execCommand('copy'); 
-          t.remove();
-          log('Logs copied using fallback');
-        }
-      }, 500);
-      pauseLogsBtn.onclick = debounce(() => {
-        isPaused = !isPaused;
-        pauseLogsBtn.textContent = isPaused ? 'Resume Logs' : 'Pause Logs';
-        if (!isPaused) {
-          logEl.textContent = logLines.join('\n');
-          logEl.scrollTop = logEl.scrollHeight;
-        }
-        log(isPaused ? 'Logs paused' : 'Logs resumed');
-      }, 500);
-      let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
-      let rx = null, tx = null;
-      function resetTransfer() { 
-        rx = null; 
-        tx = null;
-        transferInfo.textContent = 'Waiting...'; 
-        transferProg.value = 0; 
-        transferProg.max = 100;
-        setSend(ws && ws.readyState === ws.OPEN);
+    const out = document.getElementById('out');
+    const copyLogsBtn = document.getElementById('copyLogs');
+    const es = new EventSource('/logs');
+    es.onmessage = (e) => { out.textContent += e.data + "\\n"; out.scrollTop = out.scrollHeight; };
+    es.onerror = () => { out.textContent += new Date().toISOString() + " [SSE] error/closed\\n"; };
+    copyLogsBtn.onclick = async () => {
+      try { 
+        await navigator.clipboard.writeText(out.textContent); 
+        out.textContent += new Date().toISOString() + " Logs copied\\n"; 
+      } catch (e) {
+        out.textContent += new Date().toISOString() + " Copy failed: " + e.message + "\\n";
+        const t = document.createElement('textarea'); 
+        t.value = out.textContent; 
+        document.body.appendChild(t); 
+        t.select(); 
+        document.execCommand('copy'); 
+        t.remove();
+        out.textContent += new Date().toISOString() + " Logs copied (fallback)\\n";
       }
-      async function fetchFiles() {
-        try {
-          const res = await fetch('/files');
-          if (!res.ok) throw new Error('Failed to fetch files: ' + res.status);
-          const files = await res.json();
-          fileSelect.innerHTML = '<option value="">Select a file...</option>';
-          files.forEach(file => {
-            if (file.size > 0) { // Only list non-empty files
-              const opt = document.createElement('option');
-              opt.value = file.name;
-              opt.textContent = `${file.name} (${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'})`;
-              fileSelect.appendChild(opt);
-            }
-          });
-          log('Fetched file list: ' + files.map(f => f.name).join(', '));
-        } catch (e) {
-          log('Fetch files error: ' + e.message);
-          fileSelect.innerHTML = '<option value="">No files available</option>';
-        }
-      }
-      function cleanupSentMap() {
-        const now = performance.now();
-        for (const [id, t0] of sent) {
-          if (now - t0 > 5000) {
-            log(`PING timeout id=${id}`);
-            sent.delete(id);
-          }
-        }
-      }
-      function b64ToBytes(b64) {
-        try {
-          const bin = atob(b64);
-          const len = bin.length;
-          const out = new Uint8Array(len);
-          for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xFF;
-          return out;
-        } catch (e) {
-          log('b64ToBytes error: ' + e.message);
-          return new Uint8Array(0);
-        }
-      }
-      function connect() {
-        log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
-        ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
-        ws.onopen = () => { 
-          status.innerHTML = '<span class="ok">OPEN</span>'; 
-          log('OPEN ' + url); 
-          setSend(true); 
-          reconnectAttempts = 0;
-          fetchFiles();
-          try {
-            const id1 = Math.random().toString(36).slice(2);
-            sent.set(id1, performance.now());
-            ws.send(JSON.stringify({ type: 'ping', id: id1, clientTs: Date.now() }));
-            log('Client sent initial ping id=' + id1);
-            setTimeout(() => {
-              if (ws.readyState === ws.OPEN) {
-                const id2 = Math.random().toString(36).slice(2);
-                sent.set(id2, performance.now());
-                ws.send(JSON.stringify({ type: 'ping', id: id2, clientTs: Date.now() }));
-                log('Client sent second ping id=' + id2);
-              }
-            }, 50);
-          } catch (e) { 
-            log('Client send error: ' + e.message); 
-          }
-          const heartbeat = setInterval(() => {
-            if (ws.readyState === ws.OPEN) {
-              try {
-                const id = Math.random().toString(36).slice(2);
-                sent.set(id, performance.now());
-                ws.send(JSON.stringify({ type: 'ping', id, clientTs: Date.now() }));
-                log('Client heartbeat ping id=' + id);
-                cleanupSentMap();
-              } catch (e) {
-                log('Client heartbeat error: ' + e.message);
-              }
-            } else {
-              clearInterval(heartbeat);
-            }
-          }, 2000);
-        };
-        ws.onerror = () => { 
-          log('ERROR (browser hides details)'); 
-          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try direct download';
-          setSend(false);
-        };
-        ws.onclose = (e) => {
-          status.innerHTML = '<span class="bad">CLOSED</span> code=' + e.code; 
-          setSend(false); 
-          log('CLOSE code=' + e.code + ' reason="' + e.reason + '"');
-          reconnectAttempts++;
-          const delay = Math.min(20000, 5000 + reconnectAttempts * 3000);
-          log('Reconnecting in ' + delay + 'ms');
-          setTimeout(connect, delay);
-        };
-        ws.onmessage = (ev) => {
-          const start = performance.now();
-          let m = null;
-          try { 
-            m = JSON.parse(ev.data); 
-            log('MESSAGE received text length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
-          } catch { 
-            return log('TEXT parse error: ' + String(ev.data).slice(0, 200)); 
-          }
-          if (m.type === 'welcome') { 
-            log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'serverPing') { 
-            log('serverPing ' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'readyForUpload') {
-            log('READY for upload id=' + m.id);
-            if (tx && tx.id === m.id) {
-              tx.ready = true; // Mark upload as ready
-            }
-            return;
-          }
-          if (m.type === 'error') { 
-            log('ERROR ' + m.message); 
-            transferInfo.textContent = 'Error: ' + m.message;
-            resetTransfer();
-            return; 
-          }
-          if (m.type === 'pong') {
-            const t0 = sent.get(m.id);
-            if (t0) { 
-              const dt = performance.now() - t0; 
-              if (dt <= 5000) {
-                rtts.push(dt); 
-                if (rtts.length > 20) rtts.shift(); 
-                rttEl.textContent = mean(rtts).toFixed(1) + 'ms'; 
-              } else {
-                log(`PONG ignored (RTT=${dt.toFixed(1)}ms too high) id=${m.id}`);
-              }
-              sent.delete(m.id); 
-            }
-            log('PONG id=' + m.id + ' serverT=' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'fileMeta') {
-            resetTransfer();
-            rx = {
-              id: m.id,
-              name: m.name || 'download.bin',
-              size: Number(m.size) || 0,
-              mime: m.mime || 'application/octet-stream',
-              totalChunks: Number(m.chunks) || 0,
-              chunkSize: Number(m.chunkSize) || 0,
-              offset: 0,
-              gotChunks: 0,
-              buf: new Uint8Array(Number(m.size) || 0),
-              hash: m.hash
-            };
-            transferInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes, ${rx.mime}) in ${rx.totalChunks} chunks...`;
-            transferProg.max = rx.size || 1;
-            log('FILE META ' + JSON.stringify(m));
-            try {
-              ws.send(JSON.stringify({ type: 'ready', id: m.id, clientTs: Date.now() }));
-              log('Client sent ready id=' + m.id);
-            } catch (e) { 
-              log('Client ready error: ' + e.message); 
-            }
-            return;
-          }
-          if (m.type === 'fileChunk' && rx && m.id === rx.id) {
-            try {
-              const bytes = b64ToBytes(m.data || '');
-              if (bytes.length === 0) {
-                log('FILE CHUNK empty or invalid id=' + m.id + ' seq=' + m.seq);
-                return;
-              }
-              if (m.seq !== rx.gotChunks) {
-                log(`FILE CHUNK out of order id=${m.id} expected seq=${rx.gotChunks}, got=${m.seq}`);
-                return;
-              }
-              const chunkHash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
-              if (chunkHash !== m.hash) {
-                log(`FILE CHUNK hash mismatch id=${m.id} seq=${m.seq} expected=${m.hash}, got=${chunkHash}`);
-                return;
-              }
-              rx.buf.set(bytes, rx.offset);
-              rx.offset += bytes.length;
-              rx.gotChunks++;
-              transferProg.value = rx.offset;
-              if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) id=${m.id}`);
-              }
-            } catch (e) {
-              log('FILE CHUNK error: ' + e.message);
-              transferInfo.textContent = 'Download failed: ' + e.message;
-            }
-            return;
-          }
-          if (m.type === 'fileEnd' && rx && m.id === rx.id) {
-            log('FILE END ok=' + (!!m.ok) + ' total=' + rx.offset + ' bytes id=' + m.id);
-            try {
-              if (rx.offset !== rx.size) {
-                throw new Error(`Size mismatch: expected ${rx.size}, got ${rx.offset}`);
-              }
-              const finalHash = new Uint8Array(await crypto.subtle.digest('SHA-256', rx.buf)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
-              if (finalHash !== rx.hash) {
-                throw new Error(`Final hash mismatch: expected ${rx.hash}, got ${finalHash}`);
-              }
-              const blob = new Blob([rx.buf], { type: rx.mime });
-              log(`Created Blob size=${blob.size} type=${rx.mime}`);
-              const a = document.createElement('a');
-              a.href = URL.createObjectURL(blob);
-              a.download = rx.name;
-              document.body.appendChild(a);
-              a.click();
-              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000); // 120s
-              transferInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
-              fetchFiles();
-            } catch (e) {
-              log('DOWNLOAD trigger failed: ' + e.message);
-              transferInfo.textContent = 'Download failed: ' + e.message + '. Try <a href="/files/' + rx.name + '">direct download</a>.';
-            }
-            resetTransfer();
-            return;
-          }
-          if (m.type === 'uploadComplete') {
-            log('UPLOAD COMPLETE id=' + m.id + ' file=' + m.fileName + ' size=' + m.size);
-            transferInfo.textContent = 'Uploaded: ' + m.fileName + ' (' + m.size + ' bytes)';
-            resetTransfer();
-            fetchFiles();
-            return;
-          }
-          if (m.type === 'deleteComplete') {
-            log('DELETE COMPLETE id=' + m.id + ' file=' + m.fileName);
-            transferInfo.textContent = 'Deleted: ' + m.fileName;
-            resetTransfer();
-            fetchFiles();
-            return;
-          }
-          if (m.type === 'say') { 
-            log('SAY ' + JSON.stringify(m)); 
-            return; 
-          }
-          log('MSG ' + JSON.stringify(m));
-        };
-      }
-      downloadBtn.onclick = debounce(disableDuringTransfer(() => {
-        if (!ws || ws.readyState !== ws.OPEN) { 
-          log('DOWNLOAD blocked (socket not open)'); 
-          return; 
-        }
-        const fileName = fileSelect.value;
-        if (!fileName) {
-          log('DOWNLOAD blocked (no file selected)');
-          return;
-        }
-        try {
-          const id = Math.random().toString(36).slice(2);
-          ws.send(JSON.stringify({ type: 'requestFile', id, fileName, clientTs: Date.now() }));
-          log('Client requested file id=' + id + ' file=' + fileName);
-        } catch (e) {
-          log('Download request error: ' + e.message);
-        }
-      }), 500);
-      deleteBtn.onclick = debounce(disableDuringTransfer(() => {
-        if (!ws || ws.readyState !== ws.OPEN) { 
-          log('DELETE blocked (socket not open)'); 
-          return; 
-        }
-        const fileName = fileSelect.value;
-        if (!fileName) {
-          log('DELETE blocked (no file selected)');
-          return;
-        }
-        if (!confirm(`Are you sure you want to delete ${fileName}?`)) {
-          log('DELETE cancelled by user');
-          return;
-        }
-        try {
-          const id = Math.random().toString(36).slice(2);
-          ws.send(JSON.stringify({ type: 'deleteFile', id, fileName, clientTs: Date.now() }));
-          log('Client requested delete id=' + id + ' file=' + fileName);
-        } catch (e) {
-          log('Delete request error: ' + e.message);
-        }
-      }), 500);
-      uploadBtn.onclick = debounce(disableDuringTransfer(async () => {
-        if (!ws || ws.readyState !== ws.OPEN) { 
-          log('UPLOAD blocked (socket not open)'); 
-          return; 
-        }
-        const file = fileInput.files[0];
-        if (!file) {
-          log('UPLOAD blocked (no file selected)');
-          return;
-        }
-        if (file.size > 10 * 1024 * 1024) {
-          log('UPLOAD blocked: file too large (max 10MB)');
-          transferInfo.textContent = 'Upload failed: file too large (max 10MB)';
-          return;
-        }
-        const id = Math.random().toString(36).slice(2);
-        const chunkSize = 64 * 1024;
-        const totalChunks = Math.ceil(file.size / chunkSize);
-        tx = { id, fileName: file.name, size: file.size, totalChunks, chunkSize, sentChunks: 0, ready: false };
-        transferInfo.textContent = `Uploading ${tx.fileName} (${tx.size} bytes, ${file.type || 'application/octet-stream'}) in ${tx.totalChunks} chunks...`;
-        transferProg.max = tx.size || 1;
-        log(`Starting upload for ${tx.fileName} size=${tx.size} chunks=${tx.totalChunks}`);
-        ws.send(JSON.stringify({ type: 'uploadFileMeta', id, fileName: file.name, totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
-        const reader = new FileReader();
-        const sendChunk = async (i) => {
-          if (i >= totalChunks || !tx || !tx.ready) return;
-          const start = i * chunkSize;
-          const end = Math.min(file.size, start + chunkSize);
-          const slice = file.slice(start, end);
-          await new Promise((resolve) => {
-            reader.onload = async (e) => {
-              const arrayBuffer = e.target.result;
-              const bytes = new Uint8Array(arrayBuffer);
-              if (bytes.length === 0) {
-                log(`UPLOAD chunk ${i + 1} failed: empty data`);
-                transferInfo.textContent = 'Upload failed: empty chunk data';
-                resetTransfer();
-                return;
-              }
-              const b64 = btoa(String.fromCharCode.apply(null, bytes));
-              const chunkHash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
-              try {
-                ws.send(JSON.stringify({ type: 'uploadFile', id, seq: i, data: b64, hash: chunkHash, clientTs: Date.now() }));
-                tx.sentChunks++;
-                transferProg.value = end;
-                log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${bytes.length}B) id=${id}`);
-                setTimeout(() => resolve(sendChunk(i + 1)), 100);
-              } catch (e) {
-                log('UPLOAD chunk error: ' + e.message);
-                transferInfo.textContent = 'Upload failed: ' + e.message;
-                resetTransfer();
-              }
-            };
-            reader.onerror = () => {
-              log('FileReader error: ' + reader.error.message);
-              transferInfo.textContent = 'Upload failed: FileReader error';
-              resetTransfer();
-            };
-            reader.readAsArrayBuffer(slice);
-          });
-        };
-        // Wait for readyForUpload before sending chunks
-        const waitForReady = setInterval(() => {
-          if (tx && tx.ready) {
-            clearInterval(waitForReady);
-            sendChunk(0);
-          }
-        }, 100);
-      }), 500);
-      sendBtn.onclick = debounce(() => {
-        if (!ws || ws.readyState !== ws.OPEN) { 
-          log('SEND blocked (socket not open)'); 
-          return; 
-        }
-        const text = (msg.value || 'ping').trim();
-        if (text.toLowerCase() === 'ping') {
-          const id = Math.random().toString(36).slice(2);
-          sent.set(id, performance.now());
-          try { 
-            ws.send(JSON.stringify({ type: 'ping', id, clientTs: Date.now() })); 
-            log('PING id=' + id); 
-          } catch (e) { 
-            log('Send ping error: ' + e.message); 
-          }
-        } else {
-          try { 
-            ws.send(JSON.stringify({ type: 'say', text, clientTs: Date.now() })); 
-            log('SEND text=' + text); 
-          } catch (e) { 
-            log('Send text error: ' + e.message); 
-          }
-        }
-        msg.value = '';
-      }, 500);
-      reconnectBtn.onclick = debounce(() => { 
-        try { if (ws) ws.close(); } catch {} 
-        connect(); 
-      }, 500);
-      connect();
-    })();
+      out.scrollTop = out.scrollHeight;
+    };
   </script>
 </body>
 </html>
+`);
+});
+
+app.get('/logs', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Keep-Alive', 'timeout=30');
+  res.flushHeaders?.();
+  const send = (line) => res.write(`data: ${line}\n\n`);
+  const onLine = (line) => send(line);
+  logLines.forEach(line => send(line));
+  bus.on('line', onLine);
+  send(`${new Date().toISOString()} - [SSE] connected from ${req.ip || req.socket.remoteAddress}`);
+  const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 10000);
+  req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
+});
+
+// HTTP server
+const server = http.createServer(app);
+
+// WebSocket server
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
+wss.on('connection', (ws, req) => {
+  const s = ws._socket;
+  try { 
+    s.setNoDelay(true); 
+    s.setKeepAlive(true, 500);
+    log('TUNNEL socket options set: noDelay=true, keepAlive=500ms');
+  } catch (e) {
+    log('TUNNEL socket options error', e?.message || e);
+  }
+
+  attachRawSocketLogs(ws, 'TUNNEL');
+
+  const ip = req.socket.remoteAddress;
+  const origin = req.headers.origin || '(null)';
+  const ua = req.headers['user-agent'] || '(ua?)';
+  const clientId = Math.random().toString(36).slice(2);
+  log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
+
+  const transfers = new Map(); // Track uploads and downloads
+
+  try {
+    log('TUNNEL socket state before send: readyState=' + s.readyState);
+    ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
+    log('TUNNEL sent welcome');
+    ws.send(JSON.stringify({ type: 'ping', id: 'server-init', serverTs: Date.now() }));
+    log('TUNNEL sent initial ping');
+  } catch (e) {
+    log('TUNNEL initial send error', e?.message || e);
+  }
+
+  const appBeat = setInterval(() => {
+    safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
+    log('TUNNEL sent heartbeat ping');
+  }, 2000);
+
+  ws.on('message', async (data, isBinary) => {
+    if (isBinary) {
+      log('TUNNEL received unexpected binary data');
+      return safeSend(ws, { type: 'error', message: 'Binary data not supported' });
+    }
+    log(`TUNNEL message received length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
+    let m = null;
+    try { 
+      m = JSON.parse(data.toString('utf8')); 
+    } catch {
+      return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
+    }
+    if (m.type === 'ping') {
+      log('TUNNEL received client ping id=' + m.id);
+      return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
+    }
+    if (m.type === 'requestFile') {
+      log('TUNNEL received file request id=' + m.id + ' file=' + m.fileName);
+      if (!m.fileName || !m.id) {
+        return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
+      }
+      const fileName = sanitizeFileName(m.fileName);
+      const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+      if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+        log(`Invalid file path: ${filePath}`);
+        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+      }
+      let file = FILE_CACHE.get(fileName);
+      if (!file) file = await loadFileBuffer(fileName);
+      if (!file) {
+        return safeSend(ws, { type: 'error', message: `File ${fileName} not found on server.` });
+      }
+      transfers.set(m.id, { type: 'download', id: m.id, fileName, size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
+      try { 
+        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash); 
+      } catch (e) { 
+        safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
+        transfers.delete(m.id);
+      }
+      return;
+    }
+    if (m.type === 'ready') {
+      log('TUNNEL received ready id=' + m.id);
+      const transfer = transfers.get(m.id);
+      if (!transfer || transfer.type !== 'download') {
+        return safeSend(ws, { type: 'error', message: 'No active download for ID ' + m.id });
+      }
+      transfer.ready = true;
+      return;
+    }
+    if (m.type === 'uploadFileMeta') {
+      log('TUNNEL received upload file meta id=' + m.id + ' file=' + m.fileName);
+      if (!m.fileName || !m.id) {
+        return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
+      }
+      if (m.size > CONFIG.MAX_FILE_SIZE) {
+        return safeSend(ws, { type: 'error', message: 'File too large (max 10MB)' });
+      }
+      const fileName = sanitizeFileName(m.fileName);
+      const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+      if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+        log(`Invalid upload path: ${filePath}`);
+        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+      }
+      transfers.set(m.id, { type: 'upload', id: m.id, fileName, filePath, size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: m.mime || 'application/octet-stream' });
+      safeSend(ws, { type: 'readyForUpload', id: m.id });
+      log(`TUNNEL ready for upload id=${m.id} file=${fileName} size=${m.size}`);
+      return;
+    }
+    if (m.type === 'uploadFile') {
+      log(`TUNNEL received upload file chunk id=${m.id} seq=${m.seq}`);
+      const transfer = transfers.get(m.id);
+      if (!transfer || transfer.type !== 'upload') {
+        return safeSend(ws, { type: 'error', message: 'No active upload for ID ' + m.id });
+      }
+      await handleFileUpload(ws, m, transfer);
+      return;
+    }
+    if (m.type === 'deleteFile') {
+      log('TUNNEL received delete file request id=' + m.id + ' file=' + m.fileName);
+      if (!m.fileName || !m.id) {
+        return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
+      }
+      const fileName = sanitizeFileName(m.fileName);
+      const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+      if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+        log(`Invalid delete path: ${filePath}`);
+        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+      }
+      try {
+        await fsp.unlink(filePath);
+        FILE_CACHE.delete(fileName);
+        safeSend(ws, { type: 'deleteComplete', id: m.id, fileName });
+        log(`TUNNEL deleted file: ${fileName}`);
+      } catch (e) {
+        log(`TUNNEL delete error: ${e?.message || e}`);
+        safeSend(ws, { type: 'error', message: `Delete failed: ${e?.message || e}` });
+      }
+      return;
+    }
+    if (m.type === 'say') {
+      return safeSend(ws, { type: 'say', echo: m.text ?? '', serverTs: Date.now() });
+    }
+    safeSend(ws, { type: 'error', message: 'Unsupported message type' });
+  });
+
+  ws.on('error', (err) => { 
+    log('TUNNEL error:', err?.message || err); 
+    transfers.clear();
+  });
+  ws.on('close', (code, reason) => {
+    clearInterval(appBeat);
+    const r = reason && reason.toString ? reason.toString() : '';
+    log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`);
+    transfers.clear();
+  });
+});
+
+// Echo WebSocket
+const wssEcho = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
+wssEcho.on('connection', (ws, req) => {
+  attachRawSocketLogs(ws, 'ECHO');
+  const ip = req.socket.remoteAddress;
+  const origin = req.headers.origin || '(null)';
+  log(`ECHO connected ip=${ip} origin=${origin}`);
+  try { ws.send(JSON.stringify({ type: 'hello', app: CONFIG.APP_NAME })); } catch {}
+  setTimeout(() => { try { ws.close(1000, 'bye'); } catch {} }, 200);
+});
+
+function attachRawSocketLogs(ws, label) {
+  const s = ws._socket;
+  if (!s) return;
+  try { s.setNoDelay(true); } catch {}
+  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState}`));
+  s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`));
+  s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
+  s.on('timeout', () => log(`${label} RAW timeout`));
+  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`));
+}
+
+async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash) {
+  const start = performance.now();
+  const size = buffer.length;
+  const chunks = Math.ceil(size / chunkSize);
+  log(`Starting stream for ${name} id=${id} size=${size} mime=${getMimeType(name)} chunks=${chunks} hash=${hash}`);
+  safeSend(ws, { type: 'fileMeta', id, name, mime: getMimeType(name), size, chunkSize, chunks, hash });
+  log('TUNNEL sent fileMeta');
+  const transfer = transfers.get(id);
+  if (!transfer) {
+    throw new Error('Transfer not found for ID ' + id);
+  }
+  let i = 0;
+  while (i < chunks) {
+    if (ws.readyState !== ws.OPEN) {
+      log('TUNNEL stream aborted: socket closed');
+      throw new Error('socket closed during stream');
+    }
+    if (!transfer.ready) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      continue;
+    }
+    const chunkStart = performance.now();
+    const start = i * chunkSize;
+    const end = Math.min(size, start + chunkSize);
+    const slice = buffer.subarray(start, end);
+    const b64 = slice.toString('base64');
+    const chunkHash = crypto.createHash('sha256').update(slice).digest('hex');
+    try {
+      await new Promise((resolve, reject) => {
+        ws.send(JSON.stringify({ type: 'fileChunk', id, seq: i, data: b64, hash: chunkHash }), (err) => err ? reject(err) : resolve());
+      });
+      if ((i % 16) === 0 || i === chunks - 1) {
+        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} hash=${chunkHash} took ${(performance.now() - chunkStart).toFixed(1)}ms`);
+      }
+      i++;
+    } catch (e) {
+      log('TUNNEL file chunk error: ' + e.message);
+      throw e;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  safeSend(ws, { type: 'fileEnd', id, name, ok: true });
+  log(`TUNNEL sent fileEnd id=${id} totalTime=${(performance.now() - start).toFixed(1)}ms`);
+  transfers.delete(id);
+}
+
+async function handleFileUpload(ws, m, transfer) {
+  try {
+    if (m.seq !== transfer.chunks.length) {
+      log(`TUNNEL upload chunk out of order id=${transfer.id} seq=${m.seq}, expected=${transfer.chunks.length}`);
+      return safeSend(ws, { type: 'error', message: `Out of order chunk: expected ${transfer.chunks.length}, got ${m.seq}` });
+    }
+    const bytes = Buffer.from(m.data, 'base64');
+    if (bytes.length === 0) {
+      log(`TUNNEL upload chunk empty id=${transfer.id} seq=${m.seq}`);
+      return safeSend(ws, { type: 'error', message: 'Empty chunk received' });
+    }
+    const chunkHash = crypto.createHash('sha256').update(bytes).digest('hex');
+    if (chunkHash !== m.hash) {
+      log(`TUNNEL upload chunk hash mismatch id=${transfer.id} seq=${m.seq} expected=${m.hash}, got=${chunkHash}`);
+      return safeSend(ws, { type: 'error', message: 'Chunk hash mismatch' });
+    }
+    transfer.chunks[m.seq] = bytes;
+    transfer.receivedBytes += bytes.length;
+    log(`TUNNEL upload chunk id=${transfer.id} seq=${m.seq}/${transfer.totalChunks} bytes=${bytes.length} hash=${chunkHash}`);
+    if (m.seq === transfer.totalChunks - 1) {
+      if (transfer.receivedBytes !== transfer.size) {
+        log(`TUNNEL upload failed id=${transfer.id} size mismatch: expected ${transfer.size}, got ${transfer.receivedBytes}`);
+        safeSend(ws, { type: 'error', message: 'Size mismatch' });
+        transfers.delete(transfer.id);
+        return;
+      }
+      const buffer = Buffer.concat(transfer.chunks.filter(chunk => chunk));
+      const finalHash = crypto.createHash('sha256').update(buffer).digest('hex');
+      await fsp.writeFile(transfer.filePath, buffer);
+      FILE_CACHE.set(transfer.fileName, { buffer, hash: finalHash });
+      safeSend(ws, { type: 'uploadComplete', id: transfer.id, fileName: transfer.fileName, size: transfer.receivedBytes, hash: finalHash });
+      log(`TUNNEL upload complete id=${transfer.id} file=${transfer.fileName} bytes=${transfer.receivedBytes} hash=${finalHash}`);
+      transfers.delete(transfer.id);
+    }
+  } catch (e) {
+    log(`TUNNEL upload error id=${transfer.id}: ${e?.message || e}`);
+    safeSend(ws, { type: 'error', message: `Upload failed: ${e?.message || e}` });
+    transfers.delete(transfer.id);
+  }
+}
+
+function attachRawSocketLogs(ws, label) {
+  const s = ws._socket;
+  if (!s) return;
+  try { s.setNoDelay(true); } catch {}
+  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState}`));
+  s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`));
+  s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
+  s.on('timeout', () => log(`${label} RAW timeout`));
+  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`));
+}
+
+function safeSend(ws, obj) {
+  try { 
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(obj));
+      log('safeSend success: ' + JSON.stringify(obj).slice(0, 200));
+    }
+  } catch (e) { 
+    log('safeSend error', e?.message || e); 
+  } 
+}
+
+function getMimeType(fileName) {
+  const ext = path.extname(fileName).toLowerCase();
+  const mimeTypes = {
+    '.exe': 'application/vnd.microsoft.portable-executable',
+    '.sh': 'application/x-sh',
+    '.bat': 'application/x-bat',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.doc': 'application/msword',
+    '.xls': 'application/vnd.ms-excel',
+    '.ppt': 'application/vnd.ms-powerpoint',
+    '.odt': 'application/vnd.oasis.opendocument.text',
+    '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
+    '.odp': 'application/vnd.oasis.opendocument.presentation',
+    '.zip': 'application/zip',
+    '.rar': 'application/x-rar-compressed',
+    '.7z': 'application/x-7z-compressed',
+    '.gz': 'application/gzip',
+    '.tar': 'application/x-tar',
+    '.pdf': 'application/pdf',
+    '.txt': 'text/plain',
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png',
+    '.mp3': 'audio/mpeg'
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
+}
+
+function sanitizeFileName(fileName) {
+  return fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_').replace(/^_+|_+$/g, '');
+}
+
+server.listen(CONFIG.PORT, '0.0.0.0', async () => {
+  log(`web listening on :${CONFIG.PORT}`);
+});
