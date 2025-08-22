@@ -25,10 +25,17 @@
     body {
       font-family: system-ui, -apple-system, sans-serif;
       padding: 2rem;
-      max-width: 960px;
+      max-width: 1200px;
       margin: auto;
       background: var(--bg);
       color: var(--text);
+      display: flex;
+      gap: 2rem;
+      flex-wrap: wrap;
+    }
+    .left-column, .right-column {
+      flex: 1;
+      min-width: 300px;
     }
     h1 {
       font-size: 1.8rem;
@@ -41,7 +48,7 @@
       border: 1px solid #ccc3;
       border-radius: 10px;
       padding: 1.5rem;
-      margin: 1rem 0;
+      margin-bottom: 1rem;
       box-shadow: 0 2px 5px rgba(0,0,0,0.1);
     }
     .row {
@@ -94,7 +101,7 @@
       color: #0f0;
       padding: 1rem;
       border-radius: 5px;
-      max-height: 300px;
+      max-height: 600px; /* Increased height */
       overflow: auto;
       font-family: ui-monospace, monospace;
       font-size: 0.9rem;
@@ -109,65 +116,69 @@
   </style>
 </head>
 <body>
-  <h1>WebSocket Tunnel (Heroku)</h1>
-  <p class="muted">
-    Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
-    File download: <a href="/files/HelloWorld.zip" target="_blank">/files/HelloWorld.zip</a> (example).
-  </p>
-  <div class="card">
-    <div class="row">
-      <label>Endpoint</label>
-      <div><code id="ep"></code></div>
+  <div class="left-column">
+    <h1>WebSocket Tunnel (Heroku)</h1>
+    <p class="muted">
+      Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
+      File download: <a href="/files/HelloWorld.zip" target="_blank">/files/HelloWorld.zip</a> (example).
+    </p>
+    <div class="card">
+      <div class="row">
+        <label>Endpoint</label>
+        <div><code id="ep"></code></div>
+      </div>
+      <div class="row">
+        <label>Status</label>
+        <div id="status">Connecting...</div>
+      </div>
+      <div class="row">
+        <label>RTT (avg)</label>
+        <div id="rtt">--</div>
+      </div>
     </div>
-    <div class="row">
-      <label>Status</label>
-      <div id="status">Connecting...</div>
-    </div>
-    <div class="row">
-      <label>RTT (avg)</label>
-      <div id="rtt">--</div>
+    <div class="card">
+      <div class="row">
+        <label>Send Message</label>
+        <div class="controls">
+          <input id="msg" placeholder="Type text (or 'ping')" style="flex: 1"/>
+          <button id="send" disabled>Send</button>
+          <button id="reconnect">Reconnect</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>File Operations</label>
+        <div class="controls">
+          <select id="fileSelect" disabled>
+            <option value="">Select a file...</option>
+          </select>
+          <button id="downloadBtn" disabled>Download</button>
+          <button id="deleteBtn" disabled class="delete-btn">Delete</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>Upload File</label>
+        <div class="controls">
+          <input type="file" id="fileInput" disabled/>
+          <button id="uploadBtn" disabled>Upload</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>Transfer Progress</label>
+        <div>
+          <div id="transferInfo" class="muted">Waiting...</div>
+          <progress id="transferProg" max="100" value="0"></progress>
+        </div>
+      </div>
     </div>
   </div>
-  <div class="card">
-    <div class="row">
-      <label>Send Message</label>
-      <div class="controls">
-        <input id="msg" placeholder="Type text (or 'ping')" style="flex: 1"/>
-        <button id="send" disabled>Send</button>
-        <button id="reconnect">Reconnect</button>
-      </div>
-    </div>
-    <div class="row">
-      <label>File Operations</label>
-      <div class="controls">
-        <select id="fileSelect" disabled>
-          <option value="">Select a file...</option>
-        </select>
-        <button id="downloadBtn" disabled>Download</button>
-        <button id="deleteBtn" disabled class="delete-btn">Delete</button>
-      </div>
-    </div>
-    <div class="row">
-      <label>Upload File</label>
-      <div class="controls">
-        <input type="file" id="fileInput" disabled/>
-        <button id="uploadBtn" disabled>Upload</button>
-      </div>
-    </div>
-    <div class="row">
-      <label>Transfer Progress</label>
-      <div>
-        <div id="transferInfo" class="muted">Waiting...</div>
-        <progress id="transferProg" max="100" value="0"></progress>
-      </div>
-    </div>
-  </div>
-  <div class="card">
-    <div class="row">
-      <label>Client Logs</label>
-      <div>
-        <pre id="log"></pre>
-        <button id="copyLogs">Copy Logs</button>
+  <div class="right-column">
+    <div class="card">
+      <div class="row">
+        <label>Client Logs</label>
+        <div>
+          <pre id="log"></pre>
+          <button id="copyLogs">Copy Logs</button>
+        </div>
       </div>
     </div>
   </div>
@@ -260,7 +271,7 @@
           files.forEach(file => {
             const opt = document.createElement('option');
             opt.value = file.name;
-            opt.textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+            opt.textContent = `${file.name} (${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'})`;
             fileSelect.appendChild(opt);
           });
           log('Fetched file list: ' + files.map(f => f.name).join(', '));
@@ -281,6 +292,7 @@
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
         ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
+        ws.binaryType = 'arraybuffer'; // Handle binary data
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
           log('OPEN ' + url); 
@@ -335,12 +347,21 @@
         };
         ws.onmessage = (ev) => {
           const start = performance.now();
-          log('MESSAGE received length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
-          let m = null; 
-          try { 
-            m = JSON.parse(ev.data); 
-          } catch { 
-            return log('TEXT ' + String(ev.data).slice(0, 200)); 
+          let m = null;
+          if (typeof ev.data === 'string') {
+            log('MESSAGE received text length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
+            try { 
+              m = JSON.parse(ev.data); 
+            } catch { 
+              return log('TEXT parse error: ' + String(ev.data).slice(0, 200)); 
+            }
+          } else {
+            log('MESSAGE received binary length=' + ev.data.byteLength);
+            if (!rx) {
+              log('Unexpected binary data: no active download');
+              return;
+            }
+            m = { type: 'fileChunk', seq: rx.gotChunks, data: new Uint8Array(ev.data) };
           }
           if (m.type === 'welcome') { 
             log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); 
@@ -349,6 +370,10 @@
           if (m.type === 'serverPing') { 
             log('serverPing ' + m.serverTs); 
             return; 
+          }
+          if (m.type === 'readyForUpload') {
+            log('READY for upload id=' + m.id);
+            return;
           }
           if (m.type === 'error') { 
             log('ERROR ' + m.message); 
@@ -384,7 +409,7 @@
               gotChunks: 0,
               buf: new Uint8Array(Number(m.size) || 0)
             };
-            transferInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
+            transferInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes, ${rx.mime}) in ${rx.totalChunks} chunks...`;
             transferProg.max = rx.size || 1;
             log('FILE META ' + JSON.stringify(m));
             try {
@@ -399,9 +424,13 @@
           }
           if (m.type === 'fileChunk' && rx) {
             try {
-              const bytes = new Uint8Array(JSON.parse(m.data));
+              const bytes = m.data;
               if (bytes.length === 0) {
                 log('FILE CHUNK empty or invalid');
+                return;
+              }
+              if (m.seq !== rx.gotChunks) {
+                log(`FILE CHUNK out of order: expected seq=${rx.gotChunks}, got=${m.seq}`);
                 return;
               }
               rx.buf.set(bytes, rx.offset);
@@ -430,7 +459,7 @@
               a.download = rx.name;
               document.body.appendChild(a);
               a.click();
-              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 30000); // Increased timeout
+              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 60000); // Increased to 60s
               transferInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
               fetchFiles();
             } catch (e) {
@@ -515,9 +544,10 @@
         const chunkSize = 64 * 1024;
         const totalChunks = Math.ceil(file.size / chunkSize);
         tx = { id, fileName: file.name, size: file.size, totalChunks, chunkSize, sentChunks: 0 };
-        transferInfo.textContent = `Uploading ${tx.fileName} (${tx.size} bytes) in ${tx.totalChunks} chunks...`;
+        transferInfo.textContent = `Uploading ${tx.fileName} (${tx.size} bytes, ${file.type || 'application/octet-stream'}) in ${tx.totalChunks} chunks...`;
         transferProg.max = tx.size || 1;
         log(`Starting upload for ${tx.fileName} size=${tx.size} chunks=${tx.totalChunks}`);
+        ws.send(JSON.stringify({ type: 'uploadFileMeta', id, fileName: file.name, totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
         const reader = new FileReader();
         for (let i = 0; i < totalChunks; i++) {
           const start = i * chunkSize;
@@ -534,7 +564,7 @@
                 return;
               }
               try {
-                ws.send(JSON.stringify({ type: 'uploadFile', id, fileName: file.name, seq: i, data: Array.from(bytes), totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
+                ws.send(bytes, { binary: true });
                 tx.sentChunks++;
                 transferProg.value = end;
                 log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${bytes.length}B)`);
