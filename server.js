@@ -13,7 +13,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 1 * 1024, // CHANGE: Reduced to 1 KiB (for future re-enable)
+  CHUNK_SIZE: 1 * 1024, // CHANGE: Set to 1 KiB for future re-enable
 };
 
 // Central log bus → broadcasts to SSE clients
@@ -76,7 +76,6 @@ app.get('/', (_req, res) => {
     input, button { font: inherit; padding: 0.45rem; }
     button:disabled { opacity: 0.5; }
     a { color: inherit; }
-    progress { width: 100%; }
   </style>
 </head>
 <body>
@@ -86,8 +85,8 @@ app.get('/', (_req, res) => {
     File download: <a href="/HelloWorld.exe" target="_blank">/HelloWorld.exe</a>.
   </p>
   <div class="row"><div>Endpoint</div><div><code id="ep"></code></div></div>
-  <div class="row"><div>Status</div><div id="status">Connecting…</div></div>
-  <div class="row"><div>RTT (avg)</div><div id="rtt">–</div></div>
+  <div class="row"><div>Status</div><div id="status">Connecting...</div></div>
+  <div class="row"><div>RTT (avg)</div><div id="rtt">--</div></div>
   <div class="card">
     <div class="row"><div>Send</div>
       <div>
@@ -343,17 +342,7 @@ server.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
 });
 server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-wesocket-extensions']||'(none)'}`);
-  // CHANGE: Custom upgrade handler
-  if (req.url === '/ws-tunnel') {
-    socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
-                 'Upgrade: websocket\r\n' +
-                 'Connection: Upgrade\r\n' +
-                 `Sec-WebSocket-Accept: ${require('ws').createWebSocketStream({}).acceptKey(req.headers['sec-websocket-key'])}\r\n` +
-                 'Sec-WebSocket-Protocol: tunnel\r\n' +
-                 'Keep-Alive: timeout=30\r\n' +
-                 '\r\n');
-  }
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
 });
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
@@ -390,16 +379,16 @@ function attachTunnelWSS(server) {
 
   wss.on('headers', (headers, req) => {
     headers.push('Keep-Alive: timeout=30');
-    // CHANGE: Explicitly disable permessage-deflate
-    headers.push('Sec-WebSocket-Extensions: none');
+    headers.push('Sec-WebSocket-Extensions: none'); // CHANGE: Disable compression
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
+  // CHANGE: Custom upgrade handler
   wss.on('connection', (ws, req) => {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 1000); // CHANGE: Reduced to 1s
+      s.setKeepAlive(true, 1000); // CHANGE: 1s keep-alive
       log('TUNNEL socket options set: noDelay=true, keepAlive=1s');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
