@@ -13,7 +13,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 1 * 1024, // 1 KiB chunks
+  CHUNK_SIZE: 1 * 1024, // CHANGE: 1 KiB chunks for file transfer
 };
 
 // Central log bus → broadcasts to SSE clients
@@ -59,8 +59,8 @@ app.get('/HelloWorld.exe', async (_req, res) => {
 
 // Root tester
 app.get('/', (_req, res) => {
-  res.type('html').send(`
-<!DOCTYPE html>
+  // CHANGE: Clean, minimal template string to fix syntax error
+  res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -93,7 +93,7 @@ app.get('/', (_req, res) => {
         <input id="msg" placeholder="Type text (or 'ping')"/>
         <button id="send" disabled>Send</button>
         <button id="reconnect">Reconnect</button>
-        <button id="downloadBtn">Download File</button>
+        <button id="downloadBtn" disabled>Download File</button>
       </div>
     </div>
     <div class="row"><div>Download Progress</div>
@@ -172,7 +172,7 @@ app.get('/', (_req, res) => {
       }
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
-        ws = new WebSocket(url);
+        ws = new WebSocket(url, [], { perMessageDeflate: false }); // CHANGE: Disable compression
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
           log('OPEN ' + url); 
@@ -207,7 +207,7 @@ app.get('/', (_req, res) => {
             } else {
               clearInterval(heartbeat);
             }
-          }, 1000);
+          }, 1000); // CHANGE: 1s heartbeat
         };
         ws.onerror = () => { 
           log('ERROR (browser hides details)'); 
@@ -267,7 +267,7 @@ app.get('/', (_req, res) => {
               gotChunks: 0,
               buf: new Uint8Array(Number(m.size) || 0)
             };
-            pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
+            pdfInfo.textContent = \`Receiving \${rx.name} (\${rx.size} bytes) in \${rx.totalChunks} chunks...\`;
             pdfProg.max = rx.size || 100;
             log('FILE META ' + JSON.stringify(m));
             try {
@@ -292,7 +292,7 @@ app.get('/', (_req, res) => {
               rx.gotChunks++;
               if (rx.size) pdfProg.value = rx.offset;
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B)`);
+                log(\`FILE CHUNK \${rx.gotChunks}/\${rx.totalChunks} (+\${bytes.length}B)\`);
               }
             } catch (e) {
               log('FILE CHUNK error: ' + e.message);
@@ -376,8 +376,7 @@ app.get('/', (_req, res) => {
 
 // Console (SSE)
 app.get('/console', (_req, res) => {
-  res.type('html').send(`
-<!DOCTYPE html>
+  res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -453,7 +452,10 @@ server.on('upgrade', (req, socket, head) => {
   log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
 });
 
-// WS endpoints
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.requestTimeout = 0;
+
 attachTunnelWSS(server);
 attachEchoWSS(server);
 
@@ -479,11 +481,12 @@ function attachTunnelWSS(server) {
   const wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false,
+    perMessageDeflate: false, // CHANGE: Explicitly disable compression
     maxPayload: 1024 * 1024
   });
 
   wss.on('headers', (headers, req) => {
+    headers = headers.filter(h => !h.startsWith('Sec-WebSocket-Extensions')); // CHANGE: Remove compression headers
     headers.push('Keep-Alive: timeout=30');
     headers.push('Sec-WebSocket-Extensions: none');
     log('HEADERS ws-tunnel', JSON.stringify(headers));
@@ -493,7 +496,7 @@ function attachTunnelWSS(server) {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 1000); 
+      s.setKeepAlive(true, 1000); // CHANGE: 1s keep-alive
       log('TUNNEL socket options set: noDelay=true, keepAlive=1s');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
@@ -520,7 +523,7 @@ function attachTunnelWSS(server) {
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
       log('TUNNEL sent heartbeat ping');
-    }, 1000);
+    }, 1000); // CHANGE: 1s heartbeat
 
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
@@ -587,7 +590,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, 500)); // CHANGE: 500ms delay
   }
   safeSend(ws, { type: 'fileEnd', name, ok: true });
   log('TUNNEL sent fileEnd');
