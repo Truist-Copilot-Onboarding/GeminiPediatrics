@@ -92,6 +92,10 @@
         color: #fff; /* High contrast */
       }
     }
+    select[multiple] {
+      height: 150px; /* Adjusted for more options */
+      width: 200px;
+    }
     input[type="file"]::-webkit-file-upload-button {
       background: var(--primary);
       color: white;
@@ -223,11 +227,16 @@
             <button id="downloadLogs">Download Logs</button>
             <button id="pauseLogs">Pause Logs</button>
             <input id="searchLogs" placeholder="Search logs..."/>
-            <label><input type="checkbox" id="filterPingPong"> Ping/Pong/Heartbeats</label>
-            <label><input type="checkbox" id="filterFileTransfers"> File Transfers</label>
-            <label><input type="checkbox" id="filterErrors"> Errors</label>
-            <label><input type="checkbox" id="filterConnections"> Connection Events</label>
-            <label><input type="checkbox" id="filterMessages"> Messages</label>
+            <select id="logFilter" multiple>
+              <option value="all">All Logs</option>
+              <option value="ping">Ping</option>
+              <option value="pong">Pong</option>
+              <option value="heartbeat">Heartbeat</option>
+              <option value="file-transfers">File Transfers</option>
+              <option value="errors">Errors</option>
+              <option value="connections">Connection Events</option>
+              <option value="messages">Messages</option>
+            </select>
           </div>
           <pre id="log"></pre>
         </div>
@@ -247,11 +256,7 @@
       const downloadLogsBtn = document.getElementById('downloadLogs');
       const pauseLogsBtn = document.getElementById('pauseLogs');
       const searchLogs = document.getElementById('searchLogs');
-      const filterPingPong = document.getElementById('filterPingPong');
-      const filterFileTransfers = document.getElementById('filterFileTransfers');
-      const filterErrors = document.getElementById('filterErrors');
-      const filterConnections = document.getElementById('filterConnections');
-      const filterMessages = document.getElementById('filterMessages');
+      const logFilter = document.getElementById('logFilter');
       const fileSelect = document.getElementById('fileSelect');
       const downloadBtn = document.getElementById('downloadBtn');
       const deleteBtn = document.getElementById('deleteBtn');
@@ -290,22 +295,29 @@
       const updateLogDisplay = () => {
         if (isPaused) return;
         const searchTerm = searchLogs.value.toLowerCase();
-        const filters = [
-          filterPingPong.checked ? 'ping-pong' : null,
-          filterFileTransfers.checked ? 'file-transfers' : null,
-          filterErrors.checked ? 'errors' : null,
-          filterConnections.checked ? 'connections' : null,
-          filterMessages.checked ? 'messages' : null
-        ].filter(f => f);
+        const selectedFilters = Array.from(logFilter.selectedOptions).map(opt => opt.value);
+        if (selectedFilters.includes('all')) {
+          // Deselect all other options when "All Logs" is selected
+          Array.from(logFilter.options).forEach(opt => {
+            if (opt.value !== 'all') opt.selected = false;
+          });
+        }
+        const filters = selectedFilters.filter(f => f !== 'all');
         const filteredLogs = logLines.filter(line => {
-          const isPingPong = line.includes('PING') || line.includes('PONG') || line.includes('serverPing') || line.includes('heartbeat');
+          const isPing = line.includes('PING');
+          const isPong = line.includes('PONG');
+          const isHeartbeat = line.includes('serverPing') || line.includes('heartbeat');
           const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
                                 line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error');
           const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
           const isConnection = line.includes('OPEN') || line.includes('CLOSE') || line.includes('ERROR') || line.includes('WELCOME');
           const isMessage = line.includes('SAY') || line.includes('MSG');
-          if (filters.length === 0) return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
-          return (filters.includes('ping-pong') && isPingPong) ||
+          if (selectedFilters.includes('all') || filters.length === 0) {
+            return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
+          }
+          return (filters.includes('ping') && isPing) ||
+                 (filters.includes('pong') && isPong) ||
+                 (filters.includes('heartbeat') && isHeartbeat) ||
                  (filters.includes('file-transfers') && isFileTransfer) ||
                  (filters.includes('errors') && isError) ||
                  (filters.includes('connections') && isConnection) ||
@@ -363,9 +375,8 @@
         log('Search logs: ' + searchLogs.value);
         updateLogDisplay();
       }, 300);
-      filterPingPong.onchange = filterFileTransfers.onchange = filterErrors.onchange = 
-      filterConnections.onchange = filterMessages.onchange = () => {
-        log('Log filters updated');
+      logFilter.onchange = () => {
+        log('Log filters updated: ' + Array.from(logFilter.selectedOptions).map(opt => opt.value).join(', '));
         updateLogDisplay();
       };
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
@@ -530,6 +541,7 @@
             log('READY for upload id=' + m.id);
             if (tx && tx.id === m.id) {
               tx.ready = true;
+              tx.fileName = m.fileName; // Update with server-provided filename
             }
             return;
           }

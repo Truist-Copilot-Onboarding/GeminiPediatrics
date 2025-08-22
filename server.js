@@ -40,19 +40,45 @@ function log(...a) {
 process.on('uncaughtException', (e) => log('UNCAUGHT', e?.stack || e?.message || String(e)));
 process.on('unhandledRejection', (e) => log('UNHANDLED_REJECTION', e?.stack || e?.message || String(e)));
 
+// Basic authentication middleware
+function basicAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  if (!authHeader) {
+    log(`AUTH failed: No authorization header from ip=${ip}`);
+    res.setHeader('WWW-Authenticate', 'Basic realm="Restricted Area"');
+    return res.status(401).type('text').send('Authentication required');
+  }
+  const auth = Buffer.from(authHeader.replace('Basic ', ''), 'base64').toString().split(':');
+  const username = auth[0];
+  const password = auth[1];
+  if (username === 'womprats' && password === 'womprats') {
+    log(`AUTH success: User womprats authenticated from ip=${ip}`);
+    return next();
+  }
+  log(`AUTH failed: Invalid credentials from ip=${ip}`);
+  res.setHeader('WWW-Authenticate', 'Basic realm="Restricted Area"');
+  return res.status(401).type('text').send('Invalid credentials');
+}
+
 const app = express();
 app.set('trust proxy', true);
-app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
+app.use((req, res, next) => { 
+  res.setHeader('X-Content-Type-Options', 'nosniff'); 
+  next(); 
+});
 
 // Health
 app.get('/healthz', (req, res) => {
-  log(`HEALTH check from ip=${req.ip || req.socket.remoteAddress}`);
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  log(`HEALTH check from ip=${ip}`);
   res.type('text').send('ok');
 });
 
 // List files in files directory
 app.get('/files', async (req, res) => {
-  log(`FILES request from ip=${req.ip || req.socket.remoteAddress}`);
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  log(`FILES request from ip=${ip}`);
   try {
     const files = await fsp.readdir(CONFIG.FILES_DIR);
     const fileDetails = await Promise.all(files.map(async (file) => {
@@ -93,8 +119,9 @@ async function loadFileBuffer(fileName) {
   }
 }
 app.get('/files/:fileName', async (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   const fileName = sanitizeFileName(req.params.fileName);
-  log(`FILE download request for ${fileName} from ip=${req.ip || req.socket.remoteAddress}`);
+  log(`FILE download request for ${fileName} from ip=${ip}`);
   const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
   if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
     log(`Invalid file path: ${filePath}`);
@@ -121,8 +148,9 @@ app.get('/files/:fileName', async (req, res) => {
 
 // Delete file
 app.delete('/files/:fileName', async (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   const fileName = sanitizeFileName(req.params.fileName);
-  log(`DELETE request for ${fileName} from ip=${req.ip || req.socket.remoteAddress}`);
+  log(`DELETE request for ${fileName} from ip=${ip}`);
   const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
   if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
     log(`Invalid delete path: ${filePath}`);
@@ -139,9 +167,10 @@ app.delete('/files/:fileName', async (req, res) => {
   }
 });
 
-// Root tester
-app.get('/', (req, res) => {
-  log(`ROOT request from ip=${req.ip || req.socket.remoteAddress}`);
+// Root tester (client interface) with basic auth
+app.get('/', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  log(`ROOT request from ip=${ip}`);
   res.sendFile(path.join(__dirname, 'index.html'), (err) => {
     if (err) {
       log('ERROR sending index.html:', err?.message || err);
@@ -150,9 +179,10 @@ app.get('/', (req, res) => {
   });
 });
 
-// Console (SSE)
-app.get('/console', (req, res) => {
-  log(`CONSOLE request from ip=${req.ip || req.socket.remoteAddress}`);
+// Console (SSE) with basic auth
+app.get('/console', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  log(`CONSOLE request from ip=${ip}`);
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -231,7 +261,7 @@ app.get('/console', (req, res) => {
 });
 
 app.get('/logs', (req, res) => {
-  const ip = req.ip || req.socket.remoteAddress;
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   log(`LOGS SSE connected from ip=${ip}`);
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -258,7 +288,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 wss.on('headers', (headers, req) => {
-  const ip = req.ip || req.socket.remoteAddress;
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
   headers.push('Sec-WebSocket-Extensions: none');
   log(`HEADERS ws-tunnel from ip=${ip}`, JSON.stringify(headers));
@@ -266,7 +296,7 @@ wss.on('headers', (headers, req) => {
 
 wss.on('connection', (ws, req) => {
   const s = ws._socket;
-  const ip = req.ip || req.socket.remoteAddress;
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   try { 
     s.setNoDelay(true); 
     s.setKeepAlive(true, 500);
@@ -357,15 +387,25 @@ wss.on('connection', (ws, req) => {
       if (m.size > CONFIG.MAX_FILE_SIZE) {
         return safeSend(ws, { type: 'error', message: 'File too large (max 10MB)' });
       }
-      const fileName = sanitizeFileName(m.fileName);
+      let fileName = sanitizeFileName(m.fileName);
       const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
       if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
         log(`Invalid upload path: ${filePath} from ip=${ip}`);
         return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
       }
-      transfers.set(m.id, { type: 'upload', id: m.id, fileName, filePath, originalName: m.originalName || fileName.replace(/\.zip$/, ''), size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: 'application/zip' });
-      safeSend(ws, { type: 'readyForUpload', id: m.id });
-      log(`TUNNEL ready for upload id=${m.id} file=${fileName} size=${m.size} from ip=${ip}`);
+      // Check for existing file and append number if necessary
+      let finalFileName = fileName;
+      let counter = 1;
+      while (fs.existsSync(path.join(CONFIG.FILES_DIR, finalFileName))) {
+        const ext = path.extname(fileName);
+        const base = path.basename(fileName, ext);
+        finalFileName = `${base}_${counter}${ext}`;
+        counter++;
+      }
+      const finalFilePath = path.join(CONFIG.FILES_DIR, finalFileName);
+      transfers.set(m.id, { type: 'upload', id: m.id, fileName: finalFileName, filePath: finalFilePath, originalName: m.originalName || finalFileName.replace(/\.zip$/, ''), size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: 'application/zip' });
+      safeSend(ws, { type: 'readyForUpload', id: m.id, fileName: finalFileName });
+      log(`TUNNEL ready for upload id=${m.id} file=${finalFileName} size=${m.size} from ip=${ip}`);
       return;
     }
     if (m.type === 'uploadFile') {
@@ -523,7 +563,7 @@ async function handleFileUpload(ws, m, transfer, ip) {
         log(`TUNNEL upload failed: file ${transfer.originalName} not found in zip from ip=${ip}`);
         return safeSend(ws, { type: 'error', message: 'File not found in zip' });
       }
-      const filePath = path.join(CONFIG.FILES_DIR, transfer.fileName);
+      const filePath = transfer.filePath;
       await fsp.writeFile(filePath, buffer); // Store as zip
       FILE_CACHE.set(transfer.fileName, { buffer, hash: finalHash });
       safeSend(ws, { type: 'uploadComplete', id: transfer.id, fileName: transfer.fileName, size: transfer.receivedBytes, hash: finalHash });
