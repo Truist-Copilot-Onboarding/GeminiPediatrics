@@ -1,4 +1,4 @@
-// server.js — Heroku-compatible WS tunnel + live console + user-triggered download/upload (CommonJS)
+// server.js — Heroku-compatible WS tunnel + live console + user-triggered download/upload/delete (CommonJS)
 
 const http = require('http');
 const express = require('express');
@@ -13,7 +13,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   FILES_DIR: process.env.FILES_DIR || path.join(__dirname, 'files'),
   CHUNK_SIZE: 64 * 1024,
-  MAX_LOG_LINES: 100 // Limit server logs
+  MAX_LOG_LINES: 100
 };
 
 // Ensure files directory exists
@@ -74,7 +74,12 @@ async function loadFileBuffer(fileName) {
   }
 }
 app.get('/files/:fileName', async (req, res) => {
-  const fileName = req.params.fileName;
+  const fileName = sanitizeFileName(req.params.fileName);
+  const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+  if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+    log(`Invalid file path: ${filePath}`);
+    return res.status(403).type('text').send('Invalid file path.');
+  }
   let buffer = FILE_CACHE.get(fileName);
   if (!buffer) buffer = await loadFileBuffer(fileName);
   if (!buffer) return res.status(404).type('text').send('File not found.');
@@ -83,6 +88,25 @@ app.get('/files/:fileName', async (req, res) => {
     .setHeader('Content-Type', getMimeType(fileName))
     .setHeader('Content-Disposition', `inline; filename="${fileName}"`)
     .send(buffer);
+});
+
+// Delete file
+app.delete('/files/:fileName', async (req, res) => {
+  const fileName = sanitizeFileName(req.params.fileName);
+  const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+  if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+    log(`Invalid delete path: ${filePath}`);
+    return res.status(403).type('text').send('Invalid file path.');
+  }
+  try {
+    await fsp.unlink(filePath);
+    FILE_CACHE.delete(fileName);
+    log(`File deleted: ${fileName}`);
+    res.status(200).type('text').send('File deleted.');
+  } catch (e) {
+    log(`ERROR deleting file ${fileName}:`, e?.message || e);
+    res.status(404).type('text').send('File not found or cannot be deleted.');
+  }
 });
 
 // Root tester
@@ -155,7 +179,6 @@ app.get('/logs', (req, res) => {
   res.flushHeaders?.();
   const send = (line) => res.write(`data: ${line}\n\n`);
   const onLine = (line) => send(line);
-  // Send recent logs to new connections
   logLines.forEach(line => send(line));
   bus.on('line', onLine);
   send(`${new Date().toISOString()} - [SSE] connected from ${req.ip || req.socket.remoteAddress}`);
@@ -172,7 +195,7 @@ server.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
 });
 server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-wesocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
   if (req.url === '/ws-tunnel') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -252,7 +275,7 @@ function attachTunnelWSS(server) {
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
       log('TUNNEL sent heartbeat ping');
-    }, 2000); // Increased to 2 seconds
+    }, 2000);
 
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
@@ -271,14 +294,19 @@ function attachTunnelWSS(server) {
         if (!m.fileName) {
           return safeSend(ws, { type: 'error', message: 'No file name provided.' });
         }
-        const filePath = path.join(CONFIG.FILES_DIR, m.fileName);
-        let buffer = FILE_CACHE.get(m.fileName);
-        if (!buffer) buffer = loadFileBuffer(m.fileName);
+        const fileName = sanitizeFileName(m.fileName);
+        const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+        if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+          log(`Invalid file path: ${filePath}`);
+          return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+        }
+        let buffer = FILE_CACHE.get(fileName);
+        if (!buffer) buffer = loadFileBuffer(fileName);
         if (!buffer) {
-          return safeSend(ws, { type: 'error', message: `File ${m.fileName} not found on server.` });
+          return safeSend(ws, { type: 'error', message: `File ${fileName} not found on server.` });
         }
         try { 
-          streamFileOverWS(ws, buffer, m.fileName, CONFIG.CHUNK_SIZE); 
+          streamFileOverWS(ws, buffer, fileName, CONFIG.CHUNK_SIZE); 
         } catch (e) { 
           safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
         }
@@ -287,6 +315,28 @@ function attachTunnelWSS(server) {
       if (m?.type === 'uploadFile') {
         log('TUNNEL received upload file chunk id=' + m.id + ' seq=' + m.seq);
         handleFileUpload(ws, m, clientId);
+        return;
+      }
+      if (m?.type === 'deleteFile') {
+        log('TUNNEL received delete file request id=' + m.id + ' file=' + m.fileName);
+        if (!m.fileName) {
+          return safeSend(ws, { type: 'error', message: 'No file name provided.' });
+        }
+        const fileName = sanitizeFileName(m.fileName);
+        const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+        if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+          log(`Invalid delete path: ${filePath}`);
+          return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+        }
+        try {
+          fsp.unlink(filePath);
+          FILE_CACHE.delete(fileName);
+          safeSend(ws, { type: 'deleteComplete', id: m.id, fileName });
+          log(`TUNNEL deleted file: ${fileName}`);
+        } catch (e) {
+          log(`TUNNEL delete error: ${e?.message || e}`);
+          safeSend(ws, { type: 'error', message: `Delete failed: ${e?.message || e}` });
+        }
         return;
       }
       if (m?.type === 'say') {
@@ -308,6 +358,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
+  log(`Starting stream for ${name} size=${size} chunks=${chunks}`);
   safeSend(ws, { type: 'fileMeta', name, mime: getMimeType(name), size, chunkSize, chunks });
   log('TUNNEL sent fileMeta');
   for (let i = 0; i < chunks; i++) {
@@ -320,6 +371,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize) {
     const end = Math.min(size, start + chunkSize);
     const slice = buffer.subarray(start, end);
     const b64 = slice.toString('base64');
+    log(`Preparing chunk ${i + 1}/${chunks} bytes=${slice.length}`);
     try {
       await new Promise((resolve, reject) => {
         ws.send(JSON.stringify({ type: 'fileChunk', seq: i, data: b64 }), (err) => err ? reject(err) : resolve());
@@ -343,18 +395,27 @@ async function handleFileUpload(ws, m, clientId) {
   if (!fileName || !id) {
     return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
   }
-  const filePath = path.join(CONFIG.FILES_DIR, sanitizeFileName(fileName));
+  const sanitizedFileName = sanitizeFileName(fileName);
+  const filePath = path.resolve(CONFIG.FILES_DIR, sanitizedFileName);
+  if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+    log(`Invalid upload path: ${filePath}`);
+    return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+  }
   let stream = uploadStreams.get(id);
   if (!stream) {
     if (seq !== 0) {
       return safeSend(ws, { type: 'error', message: 'Upload must start with seq=0' });
     }
-    stream = { fileName, size: Number(size) || 0, totalChunks: Number(totalChunks) || 0, chunks: [], ws, clientId };
+    stream = { fileName: sanitizedFileName, size: Number(size) || 0, totalChunks: Number(totalChunks) || 0, chunks: [], ws, clientId };
     uploadStreams.set(id, stream);
-    log(`TUNNEL upload started id=${id} file=${fileName} size=${size}`);
+    log(`TUNNEL upload started id=${id} file=${sanitizedFileName} size=${size}`);
   }
   try {
     const bytes = Buffer.from(data, 'base64');
+    if (bytes.length === 0) {
+      log(`TUNNEL upload chunk empty id=${id} seq=${seq}`);
+      return safeSend(ws, { type: 'error', message: 'Empty chunk received' });
+    }
     stream.chunks[seq] = bytes;
     log(`TUNNEL upload chunk id=${id} seq=${seq}/${stream.totalChunks} bytes=${bytes.length}`);
     if (seq === stream.totalChunks - 1) {
@@ -365,11 +426,11 @@ async function handleFileUpload(ws, m, clientId) {
         uploadStreams.delete(id);
         return;
       }
-      const buffer = Buffer.concat(stream.chunks);
+      const buffer = Buffer.concat(stream.chunks.filter(chunk => chunk)); // Filter out undefined
       await fsp.writeFile(filePath, buffer);
-      FILE_CACHE.set(fileName, buffer);
-      safeSend(ws, { type: 'uploadComplete', id, fileName, size: totalBytes });
-      log(`TUNNEL upload complete id=${id} file=${fileName} bytes=${totalBytes}`);
+      FILE_CACHE.set(sanitizedFileName, buffer);
+      safeSend(ws, { type: 'uploadComplete', id, fileName: sanitizedFileName, size: totalBytes });
+      log(`TUNNEL upload complete id=${id} file=${sanitizedFileName} bytes=${totalBytes}`);
       uploadStreams.delete(id);
     }
   } catch (e) {

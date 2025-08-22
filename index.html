@@ -39,6 +39,7 @@
           <option value="">Select a file...</option>
         </select>
         <button id="downloadBtn" disabled>Download</button>
+        <button id="deleteBtn" disabled>Delete</button>
       </div>
     </div>
     <div class="row"><div>Upload File</div>
@@ -74,11 +75,12 @@
       const copyLogsBtn = document.getElementById('copyLogs');
       const fileSelect = document.getElementById('fileSelect');
       const downloadBtn = document.getElementById('downloadBtn');
+      const deleteBtn = document.getElementById('deleteBtn');
       const fileInput = document.getElementById('fileInput');
       const uploadBtn = document.getElementById('uploadBtn');
       const transferInfo = document.getElementById('transferInfo');
       const transferProg = document.getElementById('transferProg');
-      const MAX_LOG_LINES = 100; // Limit client logs
+      const MAX_LOG_LINES = 100;
       const logLines = [];
       const log = (m) => { 
         const s = new Date().toISOString() + ' ' + m; 
@@ -92,6 +94,7 @@
         sendBtn.disabled = !on;
         downloadBtn.disabled = !on;
         fileSelect.disabled = !on;
+        deleteBtn.disabled = !on;
         fileInput.disabled = !on;
         uploadBtn.disabled = !on;
       };
@@ -119,8 +122,8 @@
           const bin = atob(b64); 
           const len = bin.length;
           const out = new Uint8Array(len);
-          for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xFF;
-          log('b64ToBytes took ' + (performance.now() - start).toFixed(1) + 'ms');
+          for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i);
+          log(`b64ToBytes decoded ${len} bytes took ${(performance.now() - start).toFixed(1)}ms`);
           return out;
         } catch (e) {
           log('b64ToBytes error: ' + e.message);
@@ -154,7 +157,7 @@
       function cleanupSentMap() {
         const now = performance.now();
         for (const [id, t0] of sent) {
-          if (now - t0 > 5000) { // Remove pings older than 5 seconds
+          if (now - t0 > 5000) {
             log(`PING timeout id=${id}`);
             sent.delete(id);
           }
@@ -192,14 +195,14 @@
                 sent.set(id, performance.now());
                 ws.send(JSON.stringify({ type: 'ping', id, clientTs: Date.now() }));
                 log('Client heartbeat ping id=' + id);
-                cleanupSentMap(); // Clean up old pings
+                cleanupSentMap();
               } catch (e) {
                 log('Client heartbeat error: ' + e.message);
               }
             } else {
               clearInterval(heartbeat);
             }
-          }, 2000); // Increased to 2 seconds
+          }, 2000);
         };
         ws.onerror = () => { 
           log('ERROR (browser hides details)'); 
@@ -242,7 +245,7 @@
             const t0 = sent.get(m.id);
             if (t0) { 
               const dt = performance.now() - t0; 
-              if (dt <= 5000) { // Ignore RTTs > 5 seconds
+              if (dt <= 5000) {
                 rtts.push(dt); 
                 if (rtts.length > 20) rtts.shift(); 
                 rttEl.textContent = mean(rtts).toFixed(1) + 'ms'; 
@@ -291,7 +294,7 @@
               rx.gotChunks++;
               if (rx.size) transferProg.value = rx.offset;
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) took ${(performance.now() - start).toFixed(1)}ms`);
+                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) offset=${rx.offset}`);
               }
             } catch (e) {
               log('FILE CHUNK error: ' + e.message);
@@ -302,6 +305,9 @@
           if (m.type === 'fileEnd' && rx) {
             log('FILE END ok=' + (!!m.ok) + ' total=' + rx.offset + ' bytes took ' + (performance.now() - start).toFixed(1) + 'ms');
             try {
+              if (rx.offset !== rx.size) {
+                throw new Error(`Size mismatch: expected ${rx.size}, got ${rx.offset}`);
+              }
               const blob = new Blob([rx.buf], { type: rx.mime });
               const a = document.createElement('a');
               a.href = URL.createObjectURL(blob);
@@ -322,6 +328,12 @@
             log('UPLOAD COMPLETE id=' + m.id + ' file=' + m.fileName + ' size=' + m.size);
             transferInfo.textContent = 'Uploaded: ' + m.fileName + ' (' + m.size + ' bytes)';
             resetTransfer();
+            fetchFiles();
+            return;
+          }
+          if (m.type === 'deleteComplete') {
+            log('DELETE COMPLETE id=' + m.id + ' file=' + m.fileName);
+            transferInfo.textContent = 'Deleted: ' + m.fileName;
             fetchFiles();
             return;
           }
@@ -350,6 +362,24 @@
           log('Download request error: ' + e.message);
         }
       };
+      deleteBtn.onclick = () => {
+        if (!ws || ws.readyState !== ws.OPEN) { 
+          log('DELETE blocked (socket not open)'); 
+          return; 
+        }
+        const fileName = fileSelect.value;
+        if (!fileName) {
+          log('DELETE blocked (no file selected)');
+          return;
+        }
+        try {
+          const id = Math.random().toString(36).slice(2);
+          ws.send(JSON.stringify({ type: 'deleteFile', id, fileName, clientTs: Date.now() }));
+          log('Client requested delete id=' + id + ' file=' + fileName);
+        } catch (e) {
+          log('Delete request error: ' + e.message);
+        }
+      };
       uploadBtn.onclick = async () => {
         if (!ws || ws.readyState !== ws.OPEN) { 
           log('UPLOAD blocked (socket not open)'); 
@@ -366,6 +396,7 @@
         tx = { id, fileName: file.name, size: file.size, totalChunks, chunkSize, sentChunks: 0 };
         transferInfo.textContent = `Uploading ${tx.fileName} (${tx.size} bytes) in ${tx.totalChunks} chunks...`;
         transferProg.max = tx.size;
+        log(`Starting upload for ${tx.fileName} size=${tx.size} chunks=${tx.totalChunks}`);
         const reader = new FileReader();
         for (let i = 0; i < totalChunks; i++) {
           const start = i * chunkSize;
@@ -373,7 +404,13 @@
           const slice = file.slice(start, end);
           await new Promise((resolve) => {
             reader.onload = (e) => {
-              const b64 = e.target.result.split(',')[1];
+              const b64 = e.target.result.split(',')[1] || ''; // Ensure valid base64
+              if (!b64) {
+                log(`UPLOAD chunk ${i + 1} failed: empty base64 data`);
+                transferInfo.textContent = 'Upload failed: empty chunk data';
+                resetTransfer();
+                return;
+              }
               try {
                 ws.send(JSON.stringify({ type: 'uploadFile', id, fileName: file.name, seq: i, data: b64, totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
                 tx.sentChunks++;
@@ -385,6 +422,11 @@
                 transferInfo.textContent = 'Upload failed: ' + e.message;
                 resetTransfer();
               }
+            };
+            reader.onerror = () => {
+              log('FileReader error: ' + reader.error.message);
+              transferInfo.textContent = 'Upload failed: FileReader error';
+              resetTransfer();
             };
             reader.readAsDataURL(slice);
           });
