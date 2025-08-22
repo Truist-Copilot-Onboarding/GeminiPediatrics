@@ -13,7 +13,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 16 * 1024, // CHANGE: Increased to 16 KiB for faster transfer
+  CHUNK_SIZE: 64 * 1024, // CHANGE: 64 KiB chunks for faster transfer
 };
 
 // Central log bus → broadcasts to SSE clients
@@ -59,321 +59,13 @@ app.get('/HelloWorld.exe', async (_req, res) => {
 
 // Root tester
 app.get('/', (_req, res) => {
-  res.type('html').send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>WS Tunnel (Heroku)</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui; padding: 2rem; max-width: 960px; margin: auto; }
-    .row { display: grid; grid-template-columns: 140px 1fr; gap: 0.5rem 1rem; align-items: center; }
-    .card { border: 1px solid #ccc3; padding: 12px; border-radius: 8px; margin: 12px 0; }
-    .ok { color: #0b7; } .bad { color: #b22; } .muted { opacity: 0.8; }
-    pre { background: #111; color: #0f0; padding: 12px; border-radius: 8px; white-space: pre-wrap; max-height: 260px; overflow: auto; }
-    input, button { font: inherit; padding: 0.45rem; }
-    button:disabled { opacity: 0.5; }
-    a { color: inherit; }
-    progress { width: 100%; }
-  </style>
-</head>
-<body>
-  <h1>WebSocket Tunnel (Heroku)</h1>
-  <p class="muted">
-    Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
-    File download: <a href="/HelloWorld.exe" target="_blank">/HelloWorld.exe</a>.
-  </p>
-  <div class="row"><div>Endpoint</div><div><code id="ep"></code></div></div>
-  <div class="row"><div>Status</div><div id="status">Connecting...</div></div>
-  <div class="row"><div>RTT (avg)</div><div id="rtt">--</div></div>
-  <div class="card">
-    <div class="row"><div>Send</div>
-      <div>
-        <input id="msg" placeholder="Type text (or 'ping')"/>
-        <button id="send" disabled>Send</button>
-        <button id="reconnect">Reconnect</button>
-        <button id="downloadBtn" disabled>Download File</button>
-      </div>
-    </div>
-    <div class="row"><div>Download Progress</div>
-      <div>
-        <div id="pdfInfo" class="muted">Waiting...</div>
-        <progress id="pdfProg" max="100" value="0"></progress>
-      </div>
-    </div>
-  </div>
-  <div class="card">
-    <div class="row"><div>Log</div>
-      <div>
-        <pre id="log"></pre>
-        <button id="copyLogs">Copy Logs</button>
-      </div>
-    </div>
-  </div>
-  <script>
-    (function(){
-      const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws-tunnel';
-      document.getElementById('ep').textContent = url;
-      const status = document.getElementById('status');
-      const logEl = document.getElementById('log');
-      const rttEl = document.getElementById('rtt');
-      const sendBtn = document.getElementById('send');
-      const reconnectBtn = document.getElementById('reconnect');
-      const copyLogsBtn = document.getElementById('copyLogs');
-      const downloadBtn = document.getElementById('downloadBtn');
-      const input = document.getElementById('msg');
-      const pdfInfo = document.getElementById('pdfInfo');
-      const pdfProg = document.getElementById('pdfProg');
-      const log = (m) => { 
-        const s = new Date().toISOString() + ' ' + m; 
-        console.log(s); 
-        logEl.textContent += s + "\\n"; 
-        logEl.scrollTop = logEl.scrollHeight; 
-      };
-      const setSend = (on) => {
-        sendBtn.disabled = !on;
-        downloadBtn.disabled = !on;
-      };
-      const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-      copyLogsBtn.onclick = async () => {
-        try { 
-          await navigator.clipboard.writeText(logEl.textContent); 
-          log('Logs copied to clipboard'); 
-        } catch (e) {
-          log('Copy failed: ' + e.message);
-          const t = document.createElement('textarea'); 
-          t.value = logEl.textContent; 
-          document.body.appendChild(t); 
-          t.select(); 
-          document.execCommand('copy'); 
-          t.remove();
-          log('Logs copied using fallback');
-        }
-      };
-      let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
-      let rx = null;
-      function b64ToBytes(b64) {
-        const start = performance.now();
-        try {
-          const bin = atob(b64); 
-          const len = bin.length;
-          const out = new Uint8Array(len);
-          for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xFF;
-          log('b64ToBytes took ' + (performance.now() - start).toFixed(1) + 'ms'); // CHANGE: Log decoding time
-          return out;
-        } catch (e) {
-          log('b64ToBytes error: ' + e.message);
-          return new Uint8Array(0);
-        }
-      }
-      function resetRx() { 
-        rx = null; 
-        pdfInfo.textContent = 'Waiting...'; 
-        pdfProg.value = 0; 
-      }
-      function connect() {
-        log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
-        ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } }); // CHANGE: Force no compression
-        ws.onopen = () => { 
-          status.innerHTML = '<span class="ok">OPEN</span>'; 
-          log('OPEN ' + url); 
-          setSend(true); 
-          reconnectAttempts = 0;
-          try {
-            const id1 = Math.random().toString(36).slice(2);
-            sent.set(id1, performance.now());
-            ws.send(JSON.stringify({ type: 'ping', id: id1, clientTs: Date.now() }));
-            log('Client sent initial ping id=' + id1);
-            setTimeout(() => {
-              if (ws.readyState === ws.OPEN) {
-                const id2 = Math.random().toString(36).slice(2);
-                sent.set(id2, performance.now());
-                ws.send(JSON.stringify({ type: 'ping', id: id2, clientTs: Date.now() }));
-                log('Client sent second ping id=' + id2);
-              }
-            }, 50);
-          } catch (e) { 
-            log('Client send error: ' + e.message); 
-          }
-          const heartbeat = setInterval(() => {
-            if (ws.readyState === ws.OPEN) {
-              try {
-                const id = Math.random().toString(36).slice(2);
-                sent.set(id, performance.now());
-                ws.send(JSON.stringify({ type: 'ping', id, clientTs: Date.now() }));
-                log('Client heartbeat ping id=' + id);
-              } catch (e) {
-                log('Client heartbeat error: ' + e.message);
-              }
-            } else {
-              clearInterval(heartbeat);
-            }
-          }, 500); // CHANGE: 500ms heartbeat
-        };
-        ws.onerror = () => { 
-          log('ERROR (browser hides details)'); 
-          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.exe">direct download</a>';
-          setSend(false);
-        };
-        ws.onclose = (e) => {
-          status.innerHTML = '<span class="bad">CLOSED</span> code=' + e.code; 
-          setSend(false); 
-          log('CLOSE code=' + e.code + ' reason="' + e.reason + '"');
-          reconnectAttempts++;
-          const delay = Math.min(20000, 5000 + reconnectAttempts * 3000); // CHANGE: Fix reconnect backoff
-          log('Reconnecting in ' + delay + 'ms');
-          setTimeout(connect, delay);
-        };
-        ws.onmessage = (ev) => {
-          const start = performance.now();
-          log('MESSAGE received length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
-          let m = null; 
-          try { 
-            m = JSON.parse(ev.data); 
-          } catch { 
-            return log('TEXT ' + String(ev.data).slice(0, 200)); 
-          }
-          if (m.type === 'welcome') { 
-            log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'serverPing') { 
-            log('serverPing ' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'error') { 
-            log('ERROR ' + m.message); 
-            return; 
-          }
-          if (m.type === 'pong') {
-            const t0 = sent.get(m.id);
-            if (t0) { 
-              const dt = performance.now() - t0; 
-              rtts.push(dt); 
-              if (rtts.length > 20) rtts.shift(); 
-              rttEl.textContent = mean(rtts).toFixed(1) + ' ms'; 
-              sent.delete(m.id); 
-            }
-            log('PONG id=' + m.id + ' serverT=' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'fileMeta') {
-            resetRx();
-            rx = {
-              name: m.name || 'download.bin',
-              size: Number(m.size) || 0,
-              mime: m.mime || 'application/octet-stream',
-              totalChunks: Number(m.chunks) || 0,
-              chunkSize: Number(m.chunkSize) || 0,
-              offset: 0,
-              gotChunks: 0,
-              buf: new Uint8Array(Number(m.size) || 0)
-            };
-            pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
-            pdfProg.max = rx.size || 100;
-            log('FILE META ' + JSON.stringify(m));
-            try {
-              const id = Math.random().toString(36).slice(2);
-              sent.set(id, performance.now());
-              ws.send(JSON.stringify({ type: 'ready', id, clientTs: Date.now() }));
-              log('Client sent ready id=' + id);
-            } catch (e) { 
-              log('Client ready error: ' + e.message); 
-            }
-            return;
-          }
-          if (m.type === 'fileChunk' && rx) {
-            try {
-              const bytes = b64ToBytes(m.data || '');
-              if (bytes.length === 0) {
-                log('FILE CHUNK empty or invalid');
-                return;
-              }
-              rx.buf.set(bytes, rx.offset);
-              rx.offset += bytes.length;
-              rx.gotChunks++;
-              if (rx.size) pdfProg.value = rx.offset;
-              if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) took ${(performance.now() - start).toFixed(1)}ms`); // CHANGE: Log chunk processing time
-              }
-            } catch (e) {
-              log('FILE CHUNK error: ' + e.message);
-            }
-            return;
-          }
-          if (m.type === 'fileEnd' && rx) {
-            log('FILE END ok=' + (!!m.ok) + ' total=' + rx.offset + ' bytes took ' + (performance.now() - start).toFixed(1) + 'ms'); // CHANGE: Log total time
-            try {
-              const blob = new Blob([rx.buf], { type: rx.mime });
-              const a = document.createElement('a');
-              a.href = URL.createObjectURL(blob);
-              a.download = rx.name;
-              document.body.appendChild(a);
-              a.click();
-              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 15000);
-              pdfInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
-            } catch (e) {
-              log('DOWNLOAD trigger failed: ' + e.message);
-              pdfInfo.textContent = 'Download failed: ' + e.message + ' — try /HelloWorld.exe';
-            }
-            rx = null;
-            return;
-          }
-          if (m.type === 'say') { 
-            log('SAY ' + JSON.stringify(m)); 
-            return; 
-          }
-          log('MSG ' + JSON.stringify(m));
-        };
-      }
-      downloadBtn.onclick = () => {
-        if (!ws || ws.readyState !== ws.OPEN) { 
-          log('DOWNLOAD blocked (socket not open)'); 
-          return; 
-        }
-        try {
-          const id = Math.random().toString(36).slice(2);
-          ws.send(JSON.stringify({ type: 'requestFile', id, clientTs: Date.now() }));
-          log('Client requested file id=' + id);
-        } catch (e) {
-          log('Download request error: ' + e.message);
-        }
-      };
-      sendBtn.onclick = () => {
-        if (!ws || ws.readyState !== ws.OPEN) { 
-          log('SEND blocked (socket not open)'); 
-          return; 
-        }
-        const text = (input.value || 'ping').trim();
-        if (text.toLowerCase() === 'ping') {
-          const id = Math.random().toString(36).slice(2);
-          sent.set(id, performance.now());
-          try { 
-            ws.send(JSON.stringify({ type: 'ping', id, clientTs: Date.now() })); 
-            log('PING id=' + id); 
-          } catch (e) { 
-            log('Send ping error: ' + e.message); 
-          }
-        } else {
-          try { 
-            ws.send(JSON.stringify({ type: 'say', text, clientTs: Date.now() })); 
-            log('SEND text=' + text); 
-          } catch (e) { 
-            log('Send text error: ' + e.message); 
-          }
-        }
-        input.value = '';
-      };
-      reconnectBtn.onclick = () => { 
-        try { if (ws) ws.close(); } catch {} 
-        connect(); 
-      };
-      connect();
-    })();
-  </script>
-</body>
-</html>
-`);
+  // CHANGE: Serve index.html to avoid template string issues
+  res.sendFile(path.join(__dirname, 'index.html'), (err) => {
+    if (err) {
+      log('ERROR sending index.html:', err?.message || err);
+      res.status(500).type('text').send('Failed to load page');
+    }
+  });
 });
 
 // Console (SSE)
@@ -452,7 +144,6 @@ server.on('clientError', (err, socket) => {
 });
 server.on('upgrade', (req, socket, head) => {
   log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
-  // CHANGE: Restore working version's custom upgrade handler
   if (req.url === '/ws-tunnel') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -464,7 +155,7 @@ server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.requestTimeout = 0;
 
-let wss; // CHANGE: Define wss globally for upgrade handler
+let wss;
 attachTunnelWSS(server);
 attachEchoWSS(server);
 
@@ -490,15 +181,15 @@ function attachTunnelWSS(server) {
   wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
-    perMessageDeflate: false, // CHANGE: Explicitly disable compression
+    perMessageDeflate: false,
     maxPayload: 1024 * 1024
   });
 
   wss.on('headers', (headers, req) => {
-    headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions')); // CHANGE: Remove compression headers
+    headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
     headers.push('Keep-Alive: timeout=30');
     headers.push('Sec-WebSocket-Extensions: none');
-    headers.push('Sec-WebSocket-Protocol: tunnel'); // CHANGE: Add protocol
+    headers.push('Sec-WebSocket-Protocol: tunnel');
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
@@ -506,7 +197,7 @@ function attachTunnelWSS(server) {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 500); // CHANGE: 500ms keep-alive
+      s.setKeepAlive(true, 500);
       log('TUNNEL socket options set: noDelay=true, keepAlive=500ms');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
@@ -533,7 +224,7 @@ function attachTunnelWSS(server) {
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
       log('TUNNEL sent heartbeat ping');
-    }, 500); // CHANGE: 500ms heartbeat
+    }, 500);
 
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
@@ -596,13 +287,13 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
         ws.send(JSON.stringify({ type: 'fileChunk', seq: i, data: b64 }), (err) => err ? reject(err) : resolve());
       });
       if ((i % 16) === 0 || i === chunks - 1) {
-        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} took ${(performance.now() - chunkStart).toFixed(1)}ms`); // CHANGE: Log chunk time
+        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} took ${(performance.now() - chunkStart).toFixed(1)}ms`);
       }
     } catch (e) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 100)); // CHANGE: Reduced to 100ms delay
+    await new Promise(resolve => setTimeout(resolve, 50)); // CHANGE: 50ms delay
   }
   safeSend(ws, { type: 'fileEnd', name, ok: true });
   log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms`);
