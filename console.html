@@ -140,6 +140,30 @@
     }
     a { color: var(--primary); text-decoration: none; }
     a:hover { text-decoration: underline; }
+    .tooltip {
+      position: relative;
+      display: inline-block;
+    }
+    .tooltip .tooltiptext {
+      visibility: hidden;
+      width: 300px;
+      background-color: #555;
+      color: #fff;
+      text-align: left;
+      padding: 5px;
+      border-radius: 6px;
+      position: absolute;
+      z-index: 1;
+      top: 100%;
+      left: 50%;
+      margin-left: -150px;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .tooltip:hover .tooltiptext {
+      visibility: visible;
+      opacity: 1;
+    }
   </style>
 </head>
 <body>
@@ -235,7 +259,7 @@
         const selectedFilter = logFilter.value;
         const filteredLogs = logLines.filter(line => {
           const isPing = line.includes('PING') || line.includes('heartbeat');
-          const isPong = line.includes('PONG');
+          const isPong = line.includes('PONG') || line.includes('"pong"');
           const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
                                 line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error') || line.includes('FILE LIST');
           const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
@@ -243,7 +267,11 @@
           const isMessage = line.includes('SAY') || line.includes('MSG');
           if (selectedFilter === 'all') return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
           if (selectedFilter === 'ping') return isPing && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
-          if (selectedFilter === 'pong') return isPong && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'pong') {
+            const matches = isPong && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+            if (matches) console.log('PONG filter matched:', line);
+            return matches;
+          }
           if (selectedFilter === 'file-transfers') return isFileTransfer && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
           if (selectedFilter === 'errors') return isError && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
           if (selectedFilter === 'connections') return isConnection && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
@@ -307,7 +335,16 @@
           clients.forEach(client => {
             const row = document.createElement('tr');
             row.innerHTML = `
-              <td>${client.ip}</td>
+              <td>
+                <span class="tooltip">
+                  ${client.ip}
+                  <span class="tooltiptext">
+                    External IP: ${client.ip}<br>
+                    User-Agent: ${client.userAgent}<br>
+                    Referrer: ${client.referrer}
+                  </span>
+                </span>
+              </td>
               <td>${client.clientId}</td>
               <td>${new Date(client.connectedAt).toISOString()}</td>
               <td>
