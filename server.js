@@ -1,4 +1,4 @@
-// server.js — Heroku-compatible WS tunnel + live console + user-triggered download (CommonJS)
+// server.js — Heroku-compatible WS tunnel + live console + user-triggered download/upload (CommonJS)
 
 const http = require('http');
 const express = require('express');
@@ -9,18 +9,27 @@ const fsp = require('fs').promises;
 const path = require('path');
 
 const CONFIG = {
-  PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
+  PORT: process.env.PORT ? Number(process.env.PORT) : 80,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
-  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.zip',
-  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'),
-  CHUNK_SIZE: 64 * 1024, // CHANGE: 64 KiB chunks for faster transfer
+  FILES_DIR: process.env.FILES_DIR || path.join(__dirname, 'files'),
+  CHUNK_SIZE: 64 * 1024,
+  MAX_LOG_LINES: 100 // Limit server logs
 };
+
+// Ensure files directory exists
+if (!fs.existsSync(CONFIG.FILES_DIR)) {
+  fs.mkdirSync(CONFIG.FILES_DIR, { recursive: true });
+  log(`Created files directory at ${CONFIG.FILES_DIR}`);
+}
 
 // Central log bus → broadcasts to SSE clients
 const bus = new EventEmitter();
+const logLines = [];
 function log(...a) {
   const line = `${new Date().toISOString()} - ${a.map(v => (typeof v === 'string' ? v : JSON.stringify(v))).join(' ')}`;
   console.log(line);
+  logLines.push(line);
+  if (logLines.length > CONFIG.MAX_LOG_LINES) logLines.shift();
   bus.emit('line', line);
 }
 
@@ -35,31 +44,49 @@ app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff')
 // Health
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
-// Direct PDF (inline preview for troubleshooting)
-let PDF_BUFFER = null;
-async function loadPdfBufferOnce() {
+// List files in files directory
+app.get('/files', async (_req, res) => {
   try {
-    const b = await fsp.readFile(CONFIG.PDF_PATH);
-    PDF_BUFFER = b;
-    log(`File loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
+    const files = await fsp.readdir(CONFIG.FILES_DIR);
+    const fileDetails = await Promise.all(files.map(async (file) => {
+      const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
+      return { name: file, size: stats.size, mime: getMimeType(file) };
+    }));
+    res.status(200).json(fileDetails);
   } catch (e) {
-    PDF_BUFFER = null;
-    log(`File not found at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
+    log('ERROR listing files:', e?.message || e);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+// Direct file download
+let FILE_CACHE = new Map();
+async function loadFileBuffer(fileName) {
+  const filePath = path.join(CONFIG.FILES_DIR, fileName);
+  try {
+    const buffer = await fsp.readFile(filePath);
+    FILE_CACHE.set(fileName, buffer);
+    log(`File loaded bytes=${buffer.length} from ${filePath} (name=${fileName})`);
+    return buffer;
+  } catch (e) {
+    log(`File not found at ${filePath}`);
+    return null;
   }
 }
-app.get('/HelloWorld.zip', async (_req, res) => {
-  if (!PDF_BUFFER) await loadPdfBufferOnce();
-  if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
+app.get('/files/:fileName', async (req, res) => {
+  const fileName = req.params.fileName;
+  let buffer = FILE_CACHE.get(fileName);
+  if (!buffer) buffer = await loadFileBuffer(fileName);
+  if (!buffer) return res.status(404).type('text').send('File not found.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/zip')
-    .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
-    .send(PDF_BUFFER);
+    .setHeader('Content-Type', getMimeType(fileName))
+    .setHeader('Content-Disposition', `inline; filename="${fileName}"`)
+    .send(buffer);
 });
 
 // Root tester
 app.get('/', (_req, res) => {
-  // CHANGE: Serve index.html to avoid template string issues
   res.sendFile(path.join(__dirname, 'index.html'), (err) => {
     if (err) {
       log('ERROR sending index.html:', err?.message || err);
@@ -128,6 +155,8 @@ app.get('/logs', (req, res) => {
   res.flushHeaders?.();
   const send = (line) => res.write(`data: ${line}\n\n`);
   const onLine = (line) => send(line);
+  // Send recent logs to new connections
+  logLines.forEach(line => send(line));
   bus.on('line', onLine);
   send(`${new Date().toISOString()} - [SSE] connected from ${req.ip || req.socket.remoteAddress}`);
   const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 10000);
@@ -143,7 +172,7 @@ server.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
 });
 server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-wesocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
   if (req.url === '/ws-tunnel') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -160,7 +189,6 @@ attachTunnelWSS(server);
 attachEchoWSS(server);
 
 server.listen(CONFIG.PORT, '0.0.0.0', async () => {
-  await loadPdfBufferOnce();
   log(`web listening on :${CONFIG.PORT}`);
 });
 
@@ -224,7 +252,7 @@ function attachTunnelWSS(server) {
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
       log('TUNNEL sent heartbeat ping');
-    }, 500);
+    }, 2000); // Increased to 2 seconds
 
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
@@ -239,16 +267,26 @@ function attachTunnelWSS(server) {
         return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
       }
       if (m?.type === 'requestFile') {
-        log('TUNNEL received file request id=' + m.id);
-        if (PDF_BUFFER && ws.readyState === ws.OPEN) {
-          try { 
-            streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE); 
-          } catch (e) { 
-            safeSend(ws, { type: 'error', message: 'PDF stream failed: ' + (e?.message || e) }); 
-          }
-        } else {
-          safeSend(ws, { type: 'error', message: 'No file configured on server. Upload to ' + CONFIG.PDF_PATH + ' or set PDF_PATH.' });
+        log('TUNNEL received file request id=' + m.id + ' file=' + m.fileName);
+        if (!m.fileName) {
+          return safeSend(ws, { type: 'error', message: 'No file name provided.' });
         }
+        const filePath = path.join(CONFIG.FILES_DIR, m.fileName);
+        let buffer = FILE_CACHE.get(m.fileName);
+        if (!buffer) buffer = loadFileBuffer(m.fileName);
+        if (!buffer) {
+          return safeSend(ws, { type: 'error', message: `File ${m.fileName} not found on server.` });
+        }
+        try { 
+          streamFileOverWS(ws, buffer, m.fileName, CONFIG.CHUNK_SIZE); 
+        } catch (e) { 
+          safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
+        }
+        return;
+      }
+      if (m?.type === 'uploadFile') {
+        log('TUNNEL received upload file chunk id=' + m.id + ' seq=' + m.seq);
+        handleFileUpload(ws, m, clientId);
         return;
       }
       if (m?.type === 'say') {
@@ -266,11 +304,11 @@ function attachTunnelWSS(server) {
   });
 }
 
-async function streamPdfOverWS(ws, buffer, name, chunkSize) {
+async function streamFileOverWS(ws, buffer, name, chunkSize) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/zip', size, chunkSize, chunks });
+  safeSend(ws, { type: 'fileMeta', name, mime: getMimeType(name), size, chunkSize, chunks });
   log('TUNNEL sent fileMeta');
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
@@ -293,10 +331,52 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 50)); // CHANGE: 50ms delay
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
   safeSend(ws, { type: 'fileEnd', name, ok: true });
   log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms`);
+}
+
+const uploadStreams = new Map();
+async function handleFileUpload(ws, m, clientId) {
+  const { id, fileName, seq, data, totalChunks, size, mime } = m;
+  if (!fileName || !id) {
+    return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
+  }
+  const filePath = path.join(CONFIG.FILES_DIR, sanitizeFileName(fileName));
+  let stream = uploadStreams.get(id);
+  if (!stream) {
+    if (seq !== 0) {
+      return safeSend(ws, { type: 'error', message: 'Upload must start with seq=0' });
+    }
+    stream = { fileName, size: Number(size) || 0, totalChunks: Number(totalChunks) || 0, chunks: [], ws, clientId };
+    uploadStreams.set(id, stream);
+    log(`TUNNEL upload started id=${id} file=${fileName} size=${size}`);
+  }
+  try {
+    const bytes = Buffer.from(data, 'base64');
+    stream.chunks[seq] = bytes;
+    log(`TUNNEL upload chunk id=${id} seq=${seq}/${stream.totalChunks} bytes=${bytes.length}`);
+    if (seq === stream.totalChunks - 1) {
+      const totalBytes = stream.chunks.reduce((sum, chunk) => sum + (chunk?.length || 0), 0);
+      if (totalBytes !== stream.size) {
+        log(`TUNNEL upload failed id=${id} size mismatch: expected ${stream.size}, got ${totalBytes}`);
+        safeSend(ws, { type: 'error', message: 'Size mismatch' });
+        uploadStreams.delete(id);
+        return;
+      }
+      const buffer = Buffer.concat(stream.chunks);
+      await fsp.writeFile(filePath, buffer);
+      FILE_CACHE.set(fileName, buffer);
+      safeSend(ws, { type: 'uploadComplete', id, fileName, size: totalBytes });
+      log(`TUNNEL upload complete id=${id} file=${fileName} bytes=${totalBytes}`);
+      uploadStreams.delete(id);
+    }
+  } catch (e) {
+    log(`TUNNEL upload error id=${id}: ${e?.message || e}`);
+    safeSend(ws, { type: 'error', message: `Upload failed: ${e?.message || e}` });
+    uploadStreams.delete(id);
+  }
 }
 
 function attachRawSocketLogs(ws, label) {
@@ -319,4 +399,21 @@ function safeSend(ws, obj) {
   } catch (e) { 
     log('safeSend error', e?.message || e); 
   } 
+}
+
+function getMimeType(fileName) {
+  const ext = path.extname(fileName).toLowerCase();
+  const mimeTypes = {
+    '.zip': 'application/zip',
+    '.pdf': 'application/pdf',
+    '.txt': 'text/plain',
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png',
+    '.mp3': 'audio/mpeg'
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
+}
+
+function sanitizeFileName(fileName) {
+  return fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_').replace(/^_+|_+$/g, '');
 }

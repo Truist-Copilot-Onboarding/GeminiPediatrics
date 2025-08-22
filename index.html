@@ -10,7 +10,7 @@
     .card { border: 1px solid #ccc3; padding: 12px; border-radius: 8px; margin: 12px 0; }
     .ok { color: #0b7; } .bad { color: #b22; } .muted { opacity: 0.8; }
     pre { background: #111; color: #0f0; padding: 12px; border-radius: 8px; white-space: pre-wrap; max-height: 260px; overflow: auto; }
-    input, button { font: inherit; padding: 0.45rem; }
+    input, button, select { font: inherit; padding: 0.45rem; }
     button:disabled { opacity: 0.5; }
     a { color: inherit; }
     progress { width: 100%; }
@@ -20,7 +20,7 @@
   <h1>WebSocket Tunnel (Heroku)</h1>
   <p class="muted">
     Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
-    File download: <a href="/HelloWorld.zip" target="_blank">/HelloWorld.zip</a>.
+    File download: <a href="/files/HelloWorld.zip" target="_blank">/files/HelloWorld.zip</a> (example).
   </p>
   <div class="row"><div>Endpoint</div><div><code id="ep"></code></div></div>
   <div class="row"><div>Status</div><div id="status">Connecting...</div></div>
@@ -31,13 +31,26 @@
         <input id="msg" placeholder="Type text (or 'ping')"/>
         <button id="send" disabled>Send</button>
         <button id="reconnect">Reconnect</button>
-        <button id="downloadBtn" disabled>Download File</button>
       </div>
     </div>
-    <div class="row"><div>Download Progress</div>
+    <div class="row"><div>Download File</div>
       <div>
-        <div id="pdfInfo" class="muted">Waiting...</div>
-        <progress id="pdfProg" max="100" value="0"></progress>
+        <select id="fileSelect" disabled>
+          <option value="">Select a file...</option>
+        </select>
+        <button id="downloadBtn" disabled>Download</button>
+      </div>
+    </div>
+    <div class="row"><div>Upload File</div>
+      <div>
+        <input type="file" id="fileInput" disabled/>
+        <button id="uploadBtn" disabled>Upload</button>
+      </div>
+    </div>
+    <div class="row"><div>Transfer Progress</div>
+      <div>
+        <div id="transferInfo" class="muted">Waiting...</div>
+        <progress id="transferProg" max="100" value="0"></progress>
       </div>
     </div>
   </div>
@@ -59,19 +72,28 @@
       const sendBtn = document.getElementById('send');
       const reconnectBtn = document.getElementById('reconnect');
       const copyLogsBtn = document.getElementById('copyLogs');
+      const fileSelect = document.getElementById('fileSelect');
       const downloadBtn = document.getElementById('downloadBtn');
-      const input = document.getElementById('msg');
-      const pdfInfo = document.getElementById('pdfInfo');
-      const pdfProg = document.getElementById('pdfProg');
+      const fileInput = document.getElementById('fileInput');
+      const uploadBtn = document.getElementById('uploadBtn');
+      const transferInfo = document.getElementById('transferInfo');
+      const transferProg = document.getElementById('transferProg');
+      const MAX_LOG_LINES = 100; // Limit client logs
+      const logLines = [];
       const log = (m) => { 
         const s = new Date().toISOString() + ' ' + m; 
         console.log(s); 
-        logEl.textContent += s + "\n"; 
+        logLines.push(s);
+        if (logLines.length > MAX_LOG_LINES) logLines.shift();
+        logEl.textContent = logLines.join('\n'); 
         logEl.scrollTop = logEl.scrollHeight; 
       };
       const setSend = (on) => {
         sendBtn.disabled = !on;
         downloadBtn.disabled = !on;
+        fileSelect.disabled = !on;
+        fileInput.disabled = !on;
+        uploadBtn.disabled = !on;
       };
       const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
       copyLogsBtn.onclick = async () => {
@@ -90,7 +112,7 @@
         }
       };
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
-      let rx = null;
+      let rx = null, tx = null;
       function b64ToBytes(b64) {
         const start = performance.now();
         try {
@@ -105,10 +127,38 @@
           return new Uint8Array(0);
         }
       }
-      function resetRx() { 
+      function resetTransfer() { 
         rx = null; 
-        pdfInfo.textContent = 'Waiting...'; 
-        pdfProg.value = 0; 
+        tx = null;
+        transferInfo.textContent = 'Waiting...'; 
+        transferProg.value = 0; 
+      }
+      async function fetchFiles() {
+        try {
+          const res = await fetch('/files');
+          if (!res.ok) throw new Error('Failed to fetch files: ' + res.status);
+          const files = await res.json();
+          fileSelect.innerHTML = '<option value="">Select a file...</option>';
+          files.forEach(file => {
+            const opt = document.createElement('option');
+            opt.value = file.name;
+            opt.textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+            fileSelect.appendChild(opt);
+          });
+          log('Fetched file list: ' + files.map(f => f.name).join(', '));
+        } catch (e) {
+          log('Fetch files error: ' + e.message);
+          fileSelect.innerHTML = '<option value="">No files available</option>';
+        }
+      }
+      function cleanupSentMap() {
+        const now = performance.now();
+        for (const [id, t0] of sent) {
+          if (now - t0 > 5000) { // Remove pings older than 5 seconds
+            log(`PING timeout id=${id}`);
+            sent.delete(id);
+          }
+        }
       }
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
@@ -118,6 +168,7 @@
           log('OPEN ' + url); 
           setSend(true); 
           reconnectAttempts = 0;
+          fetchFiles();
           try {
             const id1 = Math.random().toString(36).slice(2);
             sent.set(id1, performance.now());
@@ -141,17 +192,18 @@
                 sent.set(id, performance.now());
                 ws.send(JSON.stringify({ type: 'ping', id, clientTs: Date.now() }));
                 log('Client heartbeat ping id=' + id);
+                cleanupSentMap(); // Clean up old pings
               } catch (e) {
                 log('Client heartbeat error: ' + e.message);
               }
             } else {
               clearInterval(heartbeat);
             }
-          }, 500);
+          }, 2000); // Increased to 2 seconds
         };
         ws.onerror = () => { 
           log('ERROR (browser hides details)'); 
-          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.zip">direct download</a>';
+          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try direct download';
           setSend(false);
         };
         ws.onclose = (e) => {
@@ -182,22 +234,28 @@
           }
           if (m.type === 'error') { 
             log('ERROR ' + m.message); 
+            transferInfo.textContent = 'Error: ' + m.message;
+            resetTransfer();
             return; 
           }
           if (m.type === 'pong') {
             const t0 = sent.get(m.id);
             if (t0) { 
               const dt = performance.now() - t0; 
-              rtts.push(dt); 
-              if (rtts.length > 20) rtts.shift(); 
-              rttEl.textContent = mean(rtts).toFixed(1) + ' ms'; 
+              if (dt <= 5000) { // Ignore RTTs > 5 seconds
+                rtts.push(dt); 
+                if (rtts.length > 20) rtts.shift(); 
+                rttEl.textContent = mean(rtts).toFixed(1) + 'ms'; 
+              } else {
+                log(`PONG ignored (RTT=${dt.toFixed(1)}ms too high) id=${m.id}`);
+              }
               sent.delete(m.id); 
             }
             log('PONG id=' + m.id + ' serverT=' + m.serverTs); 
             return; 
           }
           if (m.type === 'fileMeta') {
-            resetRx();
+            resetTransfer();
             rx = {
               name: m.name || 'download.bin',
               size: Number(m.size) || 0,
@@ -208,8 +266,8 @@
               gotChunks: 0,
               buf: new Uint8Array(Number(m.size) || 0)
             };
-            pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
-            pdfProg.max = rx.size || 100;
+            transferInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
+            transferProg.max = rx.size || 100;
             log('FILE META ' + JSON.stringify(m));
             try {
               const id = Math.random().toString(36).slice(2);
@@ -231,12 +289,13 @@
               rx.buf.set(bytes, rx.offset);
               rx.offset += bytes.length;
               rx.gotChunks++;
-              if (rx.size) pdfProg.value = rx.offset;
+              if (rx.size) transferProg.value = rx.offset;
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
                 log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) took ${(performance.now() - start).toFixed(1)}ms`);
               }
             } catch (e) {
               log('FILE CHUNK error: ' + e.message);
+              transferInfo.textContent = 'Download failed: ' + e.message;
             }
             return;
           }
@@ -250,12 +309,20 @@
               document.body.appendChild(a);
               a.click();
               setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 15000);
-              pdfInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
+              transferInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
+              fetchFiles();
             } catch (e) {
               log('DOWNLOAD trigger failed: ' + e.message);
-              pdfInfo.textContent = 'Download failed: ' + e.message + ' — try /HelloWorld.zip';
+              transferInfo.textContent = 'Download failed: ' + e.message;
             }
-            rx = null;
+            resetTransfer();
+            return;
+          }
+          if (m.type === 'uploadComplete') {
+            log('UPLOAD COMPLETE id=' + m.id + ' file=' + m.fileName + ' size=' + m.size);
+            transferInfo.textContent = 'Uploaded: ' + m.fileName + ' (' + m.size + ' bytes)';
+            resetTransfer();
+            fetchFiles();
             return;
           }
           if (m.type === 'say') { 
@@ -270,12 +337,57 @@
           log('DOWNLOAD blocked (socket not open)'); 
           return; 
         }
+        const fileName = fileSelect.value;
+        if (!fileName) {
+          log('DOWNLOAD blocked (no file selected)');
+          return;
+        }
         try {
           const id = Math.random().toString(36).slice(2);
-          ws.send(JSON.stringify({ type: 'requestFile', id, clientTs: Date.now() }));
-          log('Client requested file id=' + id);
+          ws.send(JSON.stringify({ type: 'requestFile', id, fileName, clientTs: Date.now() }));
+          log('Client requested file id=' + id + ' file=' + fileName);
         } catch (e) {
           log('Download request error: ' + e.message);
+        }
+      };
+      uploadBtn.onclick = async () => {
+        if (!ws || ws.readyState !== ws.OPEN) { 
+          log('UPLOAD blocked (socket not open)'); 
+          return; 
+        }
+        const file = fileInput.files[0];
+        if (!file) {
+          log('UPLOAD blocked (no file selected)');
+          return;
+        }
+        const id = Math.random().toString(36).slice(2);
+        const chunkSize = 64 * 1024;
+        const totalChunks = Math.ceil(file.size / chunkSize);
+        tx = { id, fileName: file.name, size: file.size, totalChunks, chunkSize, sentChunks: 0 };
+        transferInfo.textContent = `Uploading ${tx.fileName} (${tx.size} bytes) in ${tx.totalChunks} chunks...`;
+        transferProg.max = tx.size;
+        const reader = new FileReader();
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * chunkSize;
+          const end = Math.min(file.size, start + chunkSize);
+          const slice = file.slice(start, end);
+          await new Promise((resolve) => {
+            reader.onload = (e) => {
+              const b64 = e.target.result.split(',')[1];
+              try {
+                ws.send(JSON.stringify({ type: 'uploadFile', id, fileName: file.name, seq: i, data: b64, totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
+                tx.sentChunks++;
+                transferProg.value = end;
+                log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${end - start}B)`);
+                setTimeout(resolve, 50);
+              } catch (e) {
+                log('UPLOAD chunk error: ' + e.message);
+                transferInfo.textContent = 'Upload failed: ' + e.message;
+                resetTransfer();
+              }
+            };
+            reader.readAsDataURL(slice);
+          });
         }
       };
       sendBtn.onclick = () => {
