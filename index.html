@@ -24,18 +24,28 @@
     }
     body {
       font-family: system-ui, -apple-system, sans-serif;
-      padding: 2rem;
-      max-width: 1200px;
-      margin: auto;
+      padding: 1rem;
+      margin: 0;
       background: var(--bg);
       color: var(--text);
       display: flex;
-      gap: 2rem;
-      flex-wrap: wrap;
+      gap: 1rem;
+      min-height: 100vh;
     }
-    .left-column, .right-column {
-      flex: 1;
+    .left-column {
+      flex: 0 0 300px; /* Fixed width for left column */
+    }
+    .right-column {
+      flex: 1; /* Takes up remaining space */
       min-width: 300px;
+    }
+    @media (max-width: 800px) {
+      body {
+        flex-direction: column;
+      }
+      .left-column, .right-column {
+        flex: 1;
+      }
     }
     h1 {
       font-size: 1.8rem;
@@ -58,7 +68,7 @@
       margin-bottom: 1rem;
     }
     .row label {
-      width: 120px;
+      width: 100px;
       font-weight: 500;
     }
     .row > div { flex: 1; }
@@ -101,7 +111,7 @@
       color: #0f0;
       padding: 1rem;
       border-radius: 5px;
-      max-height: 600px; /* Increased height */
+      max-height: 80vh; /* Most of screen height */
       overflow: auto;
       font-family: ui-monospace, monospace;
       font-size: 0.9rem;
@@ -292,7 +302,7 @@
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
         ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
-        ws.binaryType = 'arraybuffer'; // Handle binary data
+        ws.binaryType = 'arraybuffer';
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
           log('OPEN ' + url); 
@@ -459,7 +469,7 @@
               a.download = rx.name;
               document.body.appendChild(a);
               a.click();
-              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 60000); // Increased to 60s
+              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000); // Increased to 120s
               transferInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
               fetchFiles();
             } catch (e) {
@@ -540,6 +550,11 @@
           log('UPLOAD blocked (no file selected)');
           return;
         }
+        if (file.size > 10 * 1024 * 1024) {
+          log('UPLOAD blocked: file too large (max 10MB)');
+          transferInfo.textContent = 'Upload failed: file too large (max 10MB)';
+          return;
+        }
         const id = Math.random().toString(36).slice(2);
         const chunkSize = 64 * 1024;
         const totalChunks = Math.ceil(file.size / chunkSize);
@@ -548,8 +563,10 @@
         transferProg.max = tx.size || 1;
         log(`Starting upload for ${tx.fileName} size=${tx.size} chunks=${tx.totalChunks}`);
         ws.send(JSON.stringify({ type: 'uploadFileMeta', id, fileName: file.name, totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
+        let chunksSent = 0;
         const reader = new FileReader();
-        for (let i = 0; i < totalChunks; i++) {
+        const sendChunk = async (i) => {
+          if (i >= totalChunks) return;
           const start = i * chunkSize;
           const end = Math.min(file.size, start + chunkSize);
           const slice = file.slice(start, end);
@@ -566,9 +583,10 @@
               try {
                 ws.send(bytes, { binary: true });
                 tx.sentChunks++;
+                chunksSent++;
                 transferProg.value = end;
                 log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${bytes.length}B)`);
-                setTimeout(resolve, 50);
+                setTimeout(() => resolve(sendChunk(i + 1)), 50);
               } catch (e) {
                 log('UPLOAD chunk error: ' + e.message);
                 transferInfo.textContent = 'Upload failed: ' + e.message;
@@ -582,7 +600,8 @@
             };
             reader.readAsArrayBuffer(slice);
           });
-        }
+        };
+        await sendChunk(0);
       }), 500);
       sendBtn.onclick = debounce(() => {
         if (!ws || ws.readyState !== ws.OPEN) { 
