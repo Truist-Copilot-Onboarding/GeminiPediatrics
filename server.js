@@ -52,9 +52,12 @@ app.get('/files', async (_req, res) => {
     const files = await fsp.readdir(CONFIG.FILES_DIR);
     const fileDetails = await Promise.all(files.map(async (file) => {
       const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
-      return { name: file, size: stats.size, mime: getMimeType(file) };
+      if (stats.size > 0) { // Only list non-empty files
+        return { name: file, size: stats.size, mime: getMimeType(file) };
+      }
+      return null;
     }));
-    res.status(200).json(fileDetails);
+    res.status(200).json(fileDetails.filter(f => f));
   } catch (e) {
     log('ERROR listing files:', e?.message || e);
     res.status(500).json({ error: 'Failed to list files' });
@@ -189,18 +192,22 @@ app.get('/logs', (req, res) => {
   req.on('close', () => { clearInterval(iv); bus.off('line', onLine); });
 });
 
-// HTTP server + WS on same port
+// HTTP server
 const server = http.createServer(app);
 
-// Diagnostics
-server.on('clientError', (err, socket) => {
-  log('HTTP clientError', err?.message || err);
-  try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
-});
+// WebSocket servers
+const wssTunnel = new WebSocketServer({ noServer: true, path: '/ws-tunnel', perMessageDeflate: false, maxPayload: 1024 * 1024 });
+const wssEcho = new WebSocketServer({ noServer: true, path: '/ws-echo', perMessageDeflate: false });
+
 server.on('upgrade', (req, socket, head) => {
-  if (req.url === '/ws-tunnel' && wss) {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
+  if (req.url === '/ws-tunnel') {
+    wssTunnel.handleUpgrade(req, socket, head, (ws) => {
+      wssTunnel.emit('connection', ws, req);
+    });
+  } else if (req.url === '/ws-echo') {
+    wssEcho.handleUpgrade(req, socket, head, (ws) => {
+      wssEcho.emit('connection', ws, req);
     });
   } else {
     log('Invalid upgrade request for ' + req.url);
@@ -212,202 +219,187 @@ server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.requestTimeout = 0;
 
-let wss;
-attachTunnelWSS(server);
-attachEchoWSS(server);
-
-server.listen(CONFIG.PORT, '0.0.0.0', async () => {
-  log(`web listening on :${CONFIG.PORT}`);
+// Tunnel WebSocket
+wssTunnel.on('headers', (headers, req) => {
+  headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
+  headers.push('Keep-Alive: timeout=30');
+  headers.push('Sec-WebSocket-Extensions: none');
+  headers.push('Sec-WebSocket-Protocol: tunnel');
+  log('HEADERS ws-tunnel', JSON.stringify(headers));
 });
 
-// WS endpoints
-function attachEchoWSS(server) {
-  const echoWss = new WebSocketServer({ noServer: true, path: '/ws-echo', perMessageDeflate: false });
-  server.on('upgrade', (req, socket, head) => {
-    if (req.url === '/ws-echo') {
-      echoWss.handleUpgrade(req, socket, head, (ws) => {
-        echoWss.emit('connection', ws, req);
-      });
+wssTunnel.on('connection', (ws, req) => {
+  const s = ws._socket;
+  try { 
+    s.setNoDelay(true); 
+    s.setKeepAlive(true, 500);
+    log('TUNNEL socket options set: noDelay=true, keepAlive=500ms');
+  } catch (e) {
+    log('TUNNEL socket options error', e?.message || e);
+  }
+
+  attachRawSocketLogs(ws, 'TUNNEL');
+
+  const ip = req.socket.remoteAddress;
+  const origin = req.headers.origin || '(null)';
+  const ua = req.headers['user-agent'] || '(ua?)';
+  const clientId = Math.random().toString(36).slice(2);
+  log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
+
+  const transfers = new Map(); // Track uploads and downloads
+
+  try {
+    log('TUNNEL socket state before send: readyState=' + s.readyState);
+    ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
+    log('TUNNEL sent welcome');
+    ws.send(JSON.stringify({ type: 'ping', id: 'server-init', serverTs: Date.now() }));
+    log('TUNNEL sent initial ping');
+  } catch (e) {
+    log('TUNNEL initial send error', e?.message || e);
+  }
+
+  const appBeat = setInterval(() => {
+    safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
+    log('TUNNEL sent heartbeat ping');
+  }, 2000);
+
+  ws.on('message', async (data, isBinary) => {
+    if (isBinary) {
+      log('TUNNEL received unexpected binary data');
+      return safeSend(ws, { type: 'error', message: 'Binary data not supported' });
     }
-  });
-  echoWss.on('connection', (ws, req) => {
-    attachRawSocketLogs(ws, 'ECHO');
-    const ip = req.socket.remoteAddress;
-    const origin = req.headers.origin || '(null)';
-    log(`ECHO connected ip=${ip} origin=${origin}`);
-    try { ws.send(JSON.stringify({ type: 'hello', app: CONFIG.APP_NAME })); } catch {}
-    setTimeout(() => { try { ws.close(1000, 'bye'); } catch {} }, 200);
-  });
-}
-
-function attachTunnelWSS(server) {
-  wss = new WebSocketServer({
-    noServer: true,
-    path: '/ws-tunnel',
-    perMessageDeflate: false,
-    maxPayload: 1024 * 1024
-  });
-
-  wss.on('headers', (headers, req) => {
-    headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
-    headers.push('Keep-Alive: timeout=30');
-    headers.push('Sec-WebSocket-Extensions: none');
-    headers.push('Sec-WebSocket-Protocol: tunnel');
-    log('HEADERS ws-tunnel', JSON.stringify(headers));
-  });
-
-  wss.on('connection', (ws, req) => {
-    const s = ws._socket;
+    log(`TUNNEL message received length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
+    let m = null;
     try { 
-      s.setNoDelay(true); 
-      s.setKeepAlive(true, 500);
-      log('TUNNEL socket options set: noDelay=true, keepAlive=500ms');
-    } catch (e) {
-      log('TUNNEL socket options error', e?.message || e);
+      m = JSON.parse(data.toString('utf8')); 
+    } catch {
+      return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
     }
-
-    attachRawSocketLogs(ws, 'TUNNEL');
-
-    const ip = req.socket.remoteAddress;
-    const origin = req.headers.origin || '(null)';
-    const ua = req.headers['user-agent'] || '(ua?)';
-    const clientId = Math.random().toString(36).slice(2);
-    log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
-
-    const transfers = new Map(); // Track uploads and downloads
-
-    try {
-      log('TUNNEL socket state before send: readyState=' + s.readyState);
-      ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
-      log('TUNNEL sent welcome');
-      ws.send(JSON.stringify({ type: 'ping', id: 'server-init', serverTs: Date.now() }));
-      log('TUNNEL sent initial ping');
-    } catch (e) {
-      log('TUNNEL initial send error', e?.message || e);
+    if (m.type === 'ping') {
+      log('TUNNEL received client ping id=' + m.id);
+      return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
     }
-
-    const appBeat = setInterval(() => {
-      safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
-      log('TUNNEL sent heartbeat ping');
-    }, 2000);
-
-    ws.on('message', async (data, isBinary) => {
-      if (isBinary) {
-        log('TUNNEL received unexpected binary data');
-        return safeSend(ws, { type: 'error', message: 'Binary data not supported' });
+    if (m.type === 'requestFile') {
+      log('TUNNEL received file request id=' + m.id + ' file=' + m.fileName);
+      if (!m.fileName || !m.id) {
+        return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
       }
-      log(`TUNNEL message received length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
-      let m = null;
+      const fileName = sanitizeFileName(m.fileName);
+      const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+      if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+        log(`Invalid file path: ${filePath}`);
+        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+      }
+      let file = FILE_CACHE.get(fileName);
+      if (!file) file = await loadFileBuffer(fileName);
+      if (!file) {
+        return safeSend(ws, { type: 'error', message: `File ${fileName} not found on server.` });
+      }
+      transfers.set(m.id, { type: 'download', id: m.id, fileName, size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
       try { 
-        m = JSON.parse(data.toString('utf8')); 
-      } catch {
-        return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
+        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash); 
+      } catch (e) { 
+        safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
+        transfers.delete(m.id);
       }
-      if (m.type === 'ping') {
-        log('TUNNEL received client ping id=' + m.id);
-        return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
+      return;
+    }
+    if (m.type === 'ready') {
+      log('TUNNEL received ready id=' + m.id);
+      const transfer = transfers.get(m.id);
+      if (!transfer || transfer.type !== 'download') {
+        return safeSend(ws, { type: 'error', message: 'No active download for ID ' + m.id });
       }
-      if (m.type === 'requestFile') {
-        log('TUNNEL received file request id=' + m.id + ' file=' + m.fileName);
-        if (!m.fileName || !m.id) {
-          return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
-        }
-        const fileName = sanitizeFileName(m.fileName);
-        const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
-        if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-          log(`Invalid file path: ${filePath}`);
-          return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
-        }
-        let file = FILE_CACHE.get(fileName);
-        if (!file) file = await loadFileBuffer(fileName);
-        if (!file) {
-          return safeSend(ws, { type: 'error', message: `File ${fileName} not found on server.` });
-        }
-        transfers.set(m.id, { type: 'download', id: m.id, fileName, size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash });
-        try { 
-          await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash); 
-        } catch (e) { 
-          safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
-          transfers.delete(m.id);
-        }
-        return;
+      transfer.ready = true;
+      return;
+    }
+    if (m.type === 'uploadFileMeta') {
+      log('TUNNEL received upload file meta id=' + m.id + ' file=' + m.fileName);
+      if (!m.fileName || !m.id) {
+        return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
       }
-      if (m.type === 'ready') {
-        log('TUNNEL received ready id=' + m.id);
-        const transfer = transfers.get(m.id);
-        if (!transfer || transfer.type !== 'download') {
-          return safeSend(ws, { type: 'error', message: 'No active download for ID ' + m.id });
-        }
-        transfer.ready = true; // Mark download as ready
-        return;
+      if (m.size > CONFIG.MAX_FILE_SIZE) {
+        return safeSend(ws, { type: 'error', message: 'File too large (max 10MB)' });
       }
-      if (m.type === 'uploadFileMeta') {
-        log('TUNNEL received upload file meta id=' + m.id + ' file=' + m.fileName);
-        if (!m.fileName || !m.id) {
-          return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
-        }
-        if (m.size > CONFIG.MAX_FILE_SIZE) {
-          return safeSend(ws, { type: 'error', message: 'File too large (max 10MB)' });
-        }
-        const fileName = sanitizeFileName(m.fileName);
-        const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
-        if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-          log(`Invalid upload path: ${filePath}`);
-          return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
-        }
-        transfers.set(m.id, { type: 'upload', id: m.id, fileName, filePath, size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: m.mime || 'application/octet-stream' });
-        safeSend(ws, { type: 'readyForUpload', id: m.id });
-        log(`TUNNEL ready for upload id=${m.id} file=${fileName} size=${m.size}`);
-        return;
+      const fileName = sanitizeFileName(m.fileName);
+      const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+      if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+        log(`Invalid upload path: ${filePath}`);
+        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
       }
-      if (m.type === 'uploadFile') {
-        log(`TUNNEL received upload file chunk id=${m.id} seq=${m.seq}`);
-        const transfer = transfers.get(m.id);
-        if (!transfer || transfer.type !== 'upload') {
-          return safeSend(ws, { type: 'error', message: 'No active upload for ID ' + m.id });
-        }
-        await handleFileUpload(ws, m, transfer);
-        return;
+      transfers.set(m.id, { type: 'upload', id: m.id, fileName, filePath, size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: m.mime || 'application/octet-stream' });
+      safeSend(ws, { type: 'readyForUpload', id: m.id });
+      log(`TUNNEL ready for upload id=${m.id} file=${fileName} size=${m.size}`);
+      return;
+    }
+    if (m.type === 'uploadFile') {
+      log(`TUNNEL received upload file chunk id=${m.id} seq=${m.seq}`);
+      const transfer = transfers.get(m.id);
+      if (!transfer || transfer.type !== 'upload') {
+        return safeSend(ws, { type: 'error', message: 'No active upload for ID ' + m.id });
       }
-      if (m.type === 'deleteFile') {
-        log('TUNNEL received delete file request id=' + m.id + ' file=' + m.fileName);
-        if (!m.fileName || !m.id) {
-          return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
-        }
-        const fileName = sanitizeFileName(m.fileName);
-        const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
-        if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-          log(`Invalid delete path: ${filePath}`);
-          return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
-        }
-        try {
-          await fsp.unlink(filePath);
-          FILE_CACHE.delete(fileName);
-          safeSend(ws, { type: 'deleteComplete', id: m.id, fileName });
-          log(`TUNNEL deleted file: ${fileName}`);
-        } catch (e) {
-          log(`TUNNEL delete error: ${e?.message || e}`);
-          safeSend(ws, { type: 'error', message: `Delete failed: ${e?.message || e}` });
-        }
-        return;
+      await handleFileUpload(ws, m, transfer);
+      return;
+    }
+    if (m.type === 'deleteFile') {
+      log('TUNNEL received delete file request id=' + m.id + ' file=' + m.fileName);
+      if (!m.fileName || !m.id) {
+        return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
       }
-      if (m.type === 'say') {
-        return safeSend(ws, { type: 'say', echo: m.text ?? '', serverTs: Date.now() });
+      const fileName = sanitizeFileName(m.fileName);
+      const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
+      if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+        log(`Invalid delete path: ${filePath}`);
+        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
       }
-      safeSend(ws, { type: 'error', message: 'Unsupported message type' });
-    });
-
-    ws.on('error', (err) => { 
-      log('TUNNEL error:', err?.message || err); 
-      transfers.clear();
-    });
-    ws.on('close', (code, reason) => {
-      clearInterval(appBeat);
-      const r = reason && reason.toString ? reason.toString() : '';
-      log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`);
-      transfers.clear();
-    });
+      try {
+        await fsp.unlink(filePath);
+        FILE_CACHE.delete(fileName);
+        safeSend(ws, { type: 'deleteComplete', id: m.id, fileName });
+        log(`TUNNEL deleted file: ${fileName}`);
+      } catch (e) {
+        log(`TUNNEL delete error: ${e?.message || e}`);
+        safeSend(ws, { type: 'error', message: `Delete failed: ${e?.message || e}` });
+      }
+      return;
+    }
+    if (m.type === 'say') {
+      return safeSend(ws, { type: 'say', echo: m.text ?? '', serverTs: Date.now() });
+    }
+    safeSend(ws, { type: 'error', message: 'Unsupported message type' });
   });
+
+  ws.on('error', (err) => { 
+    log('TUNNEL error:', err?.message || err); 
+    transfers.clear();
+  });
+  ws.on('close', (code, reason) => {
+    clearInterval(appBeat);
+    const r = reason && reason.toString ? reason.toString() : '';
+    log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`);
+    transfers.clear();
+  });
+});
+
+// Echo WebSocket
+wssEcho.on('connection', (ws, req) => {
+  attachRawSocketLogs(ws, 'ECHO');
+  const ip = req.socket.remoteAddress;
+  const origin = req.headers.origin || '(null)';
+  log(`ECHO connected ip=${ip} origin=${origin}`);
+  try { ws.send(JSON.stringify({ type: 'hello', app: CONFIG.APP_NAME })); } catch {}
+  setTimeout(() => { try { ws.close(1000, 'bye'); } catch {} }, 200);
+});
+
+function attachRawSocketLogs(ws, label) {
+  const s = ws._socket;
+  if (!s) return;
+  try { s.setNoDelay(true); } catch {}
+  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState}`));
+  s.on('end', () => log(`${label} RAW end socketState=${s.readyState}`));
+  s.on('error', (e) => log(`${label} RAW error`, e?.code || '', e?.message || e));
+  s.on('timeout', () => log(`${label} RAW timeout`));
+  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)}`));
 }
 
 async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash) {
@@ -421,14 +413,14 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash) {
   if (!transfer) {
     throw new Error('Transfer not found for ID ' + id);
   }
-  for (let i = 0; i < chunks; i++) {
+  let i = 0;
+  while (i < chunks) {
     if (ws.readyState !== ws.OPEN) {
       log('TUNNEL stream aborted: socket closed');
       throw new Error('socket closed during stream');
     }
     if (!transfer.ready) {
-      await new Promise(resolve => setTimeout(resolve, 100)); // Wait for ready
-      i--; // Retry this chunk
+      await new Promise(resolve => setTimeout(resolve, 100));
       continue;
     }
     const chunkStart = performance.now();
@@ -444,11 +436,12 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash) {
       if ((i % 16) === 0 || i === chunks - 1) {
         log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} hash=${chunkHash} took ${(performance.now() - chunkStart).toFixed(1)}ms`);
       }
+      i++;
     } catch (e) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
   safeSend(ws, { type: 'fileEnd', id, name, ok: true });
   log(`TUNNEL sent fileEnd id=${id} totalTime=${(performance.now() - start).toFixed(1)}ms`);
@@ -550,3 +543,7 @@ function getMimeType(fileName) {
 function sanitizeFileName(fileName) {
   return fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_').replace(/^_+|_+$/g, '');
 }
+
+server.listen(CONFIG.PORT, '0.0.0.0', async () => {
+  log(`web listening on :${CONFIG.PORT}`);
+});
