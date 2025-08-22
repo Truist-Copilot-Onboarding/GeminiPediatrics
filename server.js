@@ -198,11 +198,13 @@ server.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
 });
 server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
-  if (req.url === '/ws-tunnel') {
+  if (req.url === '/ws-tunnel' && wss) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
+  } else {
+    log('Invalid upgrade request for ' + req.url);
+    socket.destroy();
   }
 });
 
@@ -220,8 +222,15 @@ server.listen(CONFIG.PORT, '0.0.0.0', async () => {
 
 // WS endpoints
 function attachEchoWSS(server) {
-  const wss = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
-  wss.on('connection', (ws, req) => {
+  const echoWss = new WebSocketServer({ noServer: true, path: '/ws-echo', perMessageDeflate: false });
+  server.on('upgrade', (req, socket, head) => {
+    if (req.url === '/ws-echo') {
+      echoWss.handleUpgrade(req, socket, head, (ws) => {
+        echoWss.emit('connection', ws, req);
+      });
+    }
+  });
+  echoWss.on('connection', (ws, req) => {
     attachRawSocketLogs(ws, 'ECHO');
     const ip = req.socket.remoteAddress;
     const origin = req.headers.origin || '(null)';
@@ -233,7 +242,7 @@ function attachEchoWSS(server) {
 
 function attachTunnelWSS(server) {
   wss = new WebSocketServer({
-    server,
+    noServer: true,
     path: '/ws-tunnel',
     perMessageDeflate: false,
     maxPayload: 1024 * 1024
@@ -329,7 +338,8 @@ function attachTunnelWSS(server) {
         if (!transfer || transfer.type !== 'download') {
           return safeSend(ws, { type: 'error', message: 'No active download for ID ' + m.id });
         }
-        return; // Ready to receive chunks
+        transfer.ready = true; // Mark download as ready
+        return;
       }
       if (m.type === 'uploadFileMeta') {
         log('TUNNEL received upload file meta id=' + m.id + ' file=' + m.fileName);
@@ -407,10 +417,19 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash) {
   log(`Starting stream for ${name} id=${id} size=${size} mime=${getMimeType(name)} chunks=${chunks} hash=${hash}`);
   safeSend(ws, { type: 'fileMeta', id, name, mime: getMimeType(name), size, chunkSize, chunks, hash });
   log('TUNNEL sent fileMeta');
+  const transfer = transfers.get(id);
+  if (!transfer) {
+    throw new Error('Transfer not found for ID ' + id);
+  }
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
       log('TUNNEL stream aborted: socket closed');
       throw new Error('socket closed during stream');
+    }
+    if (!transfer.ready) {
+      await new Promise(resolve => setTimeout(resolve, 100)); // Wait for ready
+      i--; // Retry this chunk
+      continue;
     }
     const chunkStart = performance.now();
     const start = i * chunkSize;
@@ -429,7 +448,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 100)); // Increased to 100ms
+    await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay
   }
   safeSend(ws, { type: 'fileEnd', id, name, ok: true });
   log(`TUNNEL sent fileEnd id=${id} totalTime=${(performance.now() - start).toFixed(1)}ms`);
@@ -502,29 +521,23 @@ function safeSend(ws, obj) {
 function getMimeType(fileName) {
   const ext = path.extname(fileName).toLowerCase();
   const mimeTypes = {
-    // Executables
     '.exe': 'application/vnd.microsoft.portable-executable',
     '.sh': 'application/x-sh',
     '.bat': 'application/x-bat',
-    // Microsoft Office (Modern)
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    // Microsoft Office (Legacy)
     '.doc': 'application/msword',
     '.xls': 'application/vnd.ms-excel',
     '.ppt': 'application/vnd.ms-powerpoint',
-    // OpenDocument Formats
     '.odt': 'application/vnd.oasis.opendocument.text',
     '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
     '.odp': 'application/vnd.oasis.opendocument.presentation',
-    // Compression Formats
     '.zip': 'application/zip',
     '.rar': 'application/x-rar-compressed',
     '.7z': 'application/x-7z-compressed',
     '.gz': 'application/gzip',
     '.tar': 'application/x-tar',
-    // Other Common Formats
     '.pdf': 'application/pdf',
     '.txt': 'text/plain',
     '.jpg': 'image/jpeg',

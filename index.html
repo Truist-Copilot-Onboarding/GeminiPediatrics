@@ -187,7 +187,11 @@
         <label>Client Logs</label>
         <div>
           <pre id="log"></pre>
-          <button id="copyLogs">Copy Logs</button>
+          <div class="controls">
+            <button id="copyLogs">Copy Logs</button>
+            <button id="pauseLogs">Pause Logs</button>
+            <label><input type="checkbox" id="filterPingPong" checked> Filter Ping/Pong</label>
+          </div>
         </div>
       </div>
     </div>
@@ -202,6 +206,8 @@
       const sendBtn = document.getElementById('send');
       const reconnectBtn = document.getElementById('reconnect');
       const copyLogsBtn = document.getElementById('copyLogs');
+      const pauseLogsBtn = document.getElementById('pauseLogs');
+      const filterPingPong = document.getElementById('filterPingPong');
       const fileSelect = document.getElementById('fileSelect');
       const downloadBtn = document.getElementById('downloadBtn');
       const deleteBtn = document.getElementById('deleteBtn');
@@ -210,7 +216,7 @@
       const transferInfo = document.getElementById('transferInfo');
       const transferProg = document.getElementById('transferProg');
       const MAX_LOG_LINES = 100;
-      const logLines = [];
+      let logLines = [], isPaused = false;
       const debounce = (fn, delay) => {
         let timeout;
         return (...args) => {
@@ -231,12 +237,15 @@
         };
       };
       const log = (m) => { 
+        if (filterPingPong.checked && (m.includes('PING') || m.includes('PONG') || m.includes('serverPing'))) return;
         const s = new Date().toISOString() + ' ' + m; 
         console.log(s); 
         logLines.push(s);
         if (logLines.length > MAX_LOG_LINES) logLines.shift();
-        logEl.textContent = logLines.join('\n'); 
-        logEl.scrollTop = logEl.scrollHeight; 
+        if (!isPaused) {
+          logEl.textContent = logLines.join('\n'); 
+          logEl.scrollTop = logEl.scrollHeight; 
+        }
       };
       const setSend = (on) => {
         sendBtn.disabled = !on;
@@ -262,6 +271,15 @@
           log('Logs copied using fallback');
         }
       }, 500);
+      pauseLogsBtn.onclick = debounce(() => {
+        isPaused = !isPaused;
+        pauseLogsBtn.textContent = isPaused ? 'Resume Logs' : 'Pause Logs';
+        if (!isPaused) {
+          logEl.textContent = logLines.join('\n');
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+        log(isPaused ? 'Logs paused' : 'Logs resumed');
+      }, 500);
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
       let rx = null, tx = null;
       function resetTransfer() { 
@@ -279,10 +297,12 @@
           const files = await res.json();
           fileSelect.innerHTML = '<option value="">Select a file...</option>';
           files.forEach(file => {
-            const opt = document.createElement('option');
-            opt.value = file.name;
-            opt.textContent = `${file.name} (${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'})`;
-            fileSelect.appendChild(opt);
+            if (file.size > 0) { // Only list non-empty files
+              const opt = document.createElement('option');
+              opt.value = file.name;
+              opt.textContent = `${file.name} (${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'})`;
+              fileSelect.appendChild(opt);
+            }
           });
           log('Fetched file list: ' + files.map(f => f.name).join(', '));
         } catch (e) {
@@ -299,10 +319,21 @@
           }
         }
       }
+      function b64ToBytes(b64) {
+        try {
+          const bin = atob(b64);
+          const len = bin.length;
+          const out = new Uint8Array(len);
+          for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xFF;
+          return out;
+        } catch (e) {
+          log('b64ToBytes error: ' + e.message);
+          return new Uint8Array(0);
+        }
+      }
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
         ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
-        ws.binaryType = 'arraybuffer';
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
           log('OPEN ' + url); 
@@ -358,20 +389,11 @@
         ws.onmessage = (ev) => {
           const start = performance.now();
           let m = null;
-          if (typeof ev.data === 'string') {
+          try { 
+            m = JSON.parse(ev.data); 
             log('MESSAGE received text length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
-            try { 
-              m = JSON.parse(ev.data); 
-            } catch { 
-              return log('TEXT parse error: ' + String(ev.data).slice(0, 200)); 
-            }
-          } else {
-            log('MESSAGE received binary length=' + ev.data.byteLength);
-            if (!rx) {
-              log('Unexpected binary data: no active download');
-              return;
-            }
-            m = { type: 'fileChunk', seq: rx.gotChunks, data: new Uint8Array(ev.data) };
+          } catch { 
+            return log('TEXT parse error: ' + String(ev.data).slice(0, 200)); 
           }
           if (m.type === 'welcome') { 
             log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); 
@@ -383,6 +405,9 @@
           }
           if (m.type === 'readyForUpload') {
             log('READY for upload id=' + m.id);
+            if (tx && tx.id === m.id) {
+              tx.ready = true; // Mark upload as ready
+            }
             return;
           }
           if (m.type === 'error') { 
@@ -410,6 +435,7 @@
           if (m.type === 'fileMeta') {
             resetTransfer();
             rx = {
+              id: m.id,
               name: m.name || 'download.bin',
               size: Number(m.size) || 0,
               mime: m.mime || 'application/octet-stream',
@@ -417,30 +443,34 @@
               chunkSize: Number(m.chunkSize) || 0,
               offset: 0,
               gotChunks: 0,
-              buf: new Uint8Array(Number(m.size) || 0)
+              buf: new Uint8Array(Number(m.size) || 0),
+              hash: m.hash
             };
             transferInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes, ${rx.mime}) in ${rx.totalChunks} chunks...`;
             transferProg.max = rx.size || 1;
             log('FILE META ' + JSON.stringify(m));
             try {
-              const id = Math.random().toString(36).slice(2);
-              sent.set(id, performance.now());
-              ws.send(JSON.stringify({ type: 'ready', id, clientTs: Date.now() }));
-              log('Client sent ready id=' + id);
+              ws.send(JSON.stringify({ type: 'ready', id: m.id, clientTs: Date.now() }));
+              log('Client sent ready id=' + m.id);
             } catch (e) { 
               log('Client ready error: ' + e.message); 
             }
             return;
           }
-          if (m.type === 'fileChunk' && rx) {
+          if (m.type === 'fileChunk' && rx && m.id === rx.id) {
             try {
-              const bytes = m.data;
+              const bytes = b64ToBytes(m.data || '');
               if (bytes.length === 0) {
-                log('FILE CHUNK empty or invalid');
+                log('FILE CHUNK empty or invalid id=' + m.id + ' seq=' + m.seq);
                 return;
               }
               if (m.seq !== rx.gotChunks) {
-                log(`FILE CHUNK out of order: expected seq=${rx.gotChunks}, got=${m.seq}`);
+                log(`FILE CHUNK out of order id=${m.id} expected seq=${rx.gotChunks}, got=${m.seq}`);
+                return;
+              }
+              const chunkHash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
+              if (chunkHash !== m.hash) {
+                log(`FILE CHUNK hash mismatch id=${m.id} seq=${m.seq} expected=${m.hash}, got=${chunkHash}`);
                 return;
               }
               rx.buf.set(bytes, rx.offset);
@@ -448,7 +478,7 @@
               rx.gotChunks++;
               transferProg.value = rx.offset;
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) offset=${rx.offset}`);
+                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) id=${m.id}`);
               }
             } catch (e) {
               log('FILE CHUNK error: ' + e.message);
@@ -456,11 +486,15 @@
             }
             return;
           }
-          if (m.type === 'fileEnd' && rx) {
-            log('FILE END ok=' + (!!m.ok) + ' total=' + rx.offset + ' bytes took ' + (performance.now() - start).toFixed(1) + 'ms');
+          if (m.type === 'fileEnd' && rx && m.id === rx.id) {
+            log('FILE END ok=' + (!!m.ok) + ' total=' + rx.offset + ' bytes id=' + m.id);
             try {
               if (rx.offset !== rx.size) {
                 throw new Error(`Size mismatch: expected ${rx.size}, got ${rx.offset}`);
+              }
+              const finalHash = new Uint8Array(await crypto.subtle.digest('SHA-256', rx.buf)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
+              if (finalHash !== rx.hash) {
+                throw new Error(`Final hash mismatch: expected ${rx.hash}, got ${finalHash}`);
               }
               const blob = new Blob([rx.buf], { type: rx.mime });
               log(`Created Blob size=${blob.size} type=${rx.mime}`);
@@ -469,7 +503,7 @@
               a.download = rx.name;
               document.body.appendChild(a);
               a.click();
-              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000); // Increased to 120s
+              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000); // 120s
               transferInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
               fetchFiles();
             } catch (e) {
@@ -558,20 +592,19 @@
         const id = Math.random().toString(36).slice(2);
         const chunkSize = 64 * 1024;
         const totalChunks = Math.ceil(file.size / chunkSize);
-        tx = { id, fileName: file.name, size: file.size, totalChunks, chunkSize, sentChunks: 0 };
+        tx = { id, fileName: file.name, size: file.size, totalChunks, chunkSize, sentChunks: 0, ready: false };
         transferInfo.textContent = `Uploading ${tx.fileName} (${tx.size} bytes, ${file.type || 'application/octet-stream'}) in ${tx.totalChunks} chunks...`;
         transferProg.max = tx.size || 1;
         log(`Starting upload for ${tx.fileName} size=${tx.size} chunks=${tx.totalChunks}`);
         ws.send(JSON.stringify({ type: 'uploadFileMeta', id, fileName: file.name, totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
-        let chunksSent = 0;
         const reader = new FileReader();
         const sendChunk = async (i) => {
-          if (i >= totalChunks) return;
+          if (i >= totalChunks || !tx || !tx.ready) return;
           const start = i * chunkSize;
           const end = Math.min(file.size, start + chunkSize);
           const slice = file.slice(start, end);
           await new Promise((resolve) => {
-            reader.onload = (e) => {
+            reader.onload = async (e) => {
               const arrayBuffer = e.target.result;
               const bytes = new Uint8Array(arrayBuffer);
               if (bytes.length === 0) {
@@ -580,13 +613,14 @@
                 resetTransfer();
                 return;
               }
+              const b64 = btoa(String.fromCharCode.apply(null, bytes));
+              const chunkHash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
               try {
-                ws.send(bytes, { binary: true });
+                ws.send(JSON.stringify({ type: 'uploadFile', id, seq: i, data: b64, hash: chunkHash, clientTs: Date.now() }));
                 tx.sentChunks++;
-                chunksSent++;
                 transferProg.value = end;
-                log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${bytes.length}B)`);
-                setTimeout(() => resolve(sendChunk(i + 1)), 50);
+                log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${bytes.length}B) id=${id}`);
+                setTimeout(() => resolve(sendChunk(i + 1)), 100);
               } catch (e) {
                 log('UPLOAD chunk error: ' + e.message);
                 transferInfo.textContent = 'Upload failed: ' + e.message;
@@ -601,14 +635,20 @@
             reader.readAsArrayBuffer(slice);
           });
         };
-        await sendChunk(0);
+        // Wait for readyForUpload before sending chunks
+        const waitForReady = setInterval(() => {
+          if (tx && tx.ready) {
+            clearInterval(waitForReady);
+            sendChunk(0);
+          }
+        }, 100);
       }), 500);
       sendBtn.onclick = debounce(() => {
         if (!ws || ws.readyState !== ws.OPEN) { 
           log('SEND blocked (socket not open)'); 
           return; 
         }
-        const text = (input.value || 'ping').trim();
+        const text = (msg.value || 'ping').trim();
         if (text.toLowerCase() === 'ping') {
           const id = Math.random().toString(36).slice(2);
           sent.set(id, performance.now());
@@ -626,7 +666,7 @@
             log('Send text error: ' + e.message); 
           }
         }
-        input.value = '';
+        msg.value = '';
       }, 500);
       reconnectBtn.onclick = debounce(() => { 
         try { if (ws) ws.close(); } catch {} 
