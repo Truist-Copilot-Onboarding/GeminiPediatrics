@@ -5,12 +5,12 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": "20.x", // Match your local node --version
-    "npm": "10.x"   // Match your local npm --version
+    "node": "20.x",
+    "npm": "10.x"
   },
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.18.0",
-    "adm-zip": "^0.5.16" // NEW: Added for zip validation
+    "adm-zip": "^0.5.16"
   }
 }
