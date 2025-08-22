@@ -7,13 +7,15 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
+const crypto = require('crypto');
 
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 80,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   FILES_DIR: process.env.FILES_DIR || path.join(__dirname, 'files'),
   CHUNK_SIZE: 64 * 1024,
-  MAX_LOG_LINES: 100
+  MAX_LOG_LINES: 100,
+  MAX_FILE_SIZE: 10 * 1024 * 1024 // 10MB limit
 };
 
 // Ensure files directory exists
@@ -65,9 +67,10 @@ async function loadFileBuffer(fileName) {
   const filePath = path.join(CONFIG.FILES_DIR, fileName);
   try {
     const buffer = await fsp.readFile(filePath);
-    FILE_CACHE.set(fileName, buffer);
-    log(`File loaded bytes=${buffer.length} from ${filePath} (name=${fileName}, mime=${getMimeType(fileName)})`);
-    return buffer;
+    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    FILE_CACHE.set(fileName, { buffer, hash });
+    log(`File loaded bytes=${buffer.length} hash=${hash} from ${filePath} (name=${fileName}, mime=${getMimeType(fileName)})`);
+    return { buffer, hash };
   } catch (e) {
     log(`File not found at ${filePath}: ${e.message}`);
     return null;
@@ -80,14 +83,14 @@ app.get('/files/:fileName', async (req, res) => {
     log(`Invalid file path: ${filePath}`);
     return res.status(403).type('text').send('Invalid file path.');
   }
-  let buffer = FILE_CACHE.get(fileName);
-  if (!buffer) buffer = await loadFileBuffer(fileName);
-  if (!buffer) return res.status(404).type('text').send('File not found.');
+  let file = FILE_CACHE.get(fileName);
+  if (!file) file = await loadFileBuffer(fileName);
+  if (!file) return res.status(404).type('text').send('File not found.');
   res
     .status(200)
     .setHeader('Content-Type', getMimeType(fileName))
     .setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
-    .send(buffer);
+    .send(file.buffer);
 });
 
 // Delete file
@@ -262,8 +265,7 @@ function attachTunnelWSS(server) {
     const clientId = Math.random().toString(36).slice(2);
     log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
 
-    let currentDownload = null; // Track active download
-    let currentUpload = null; // Track active upload
+    const transfers = new Map(); // Track uploads and downloads
 
     try {
       log('TUNNEL socket state before send: readyState=' + s.readyState);
@@ -280,7 +282,7 @@ function attachTunnelWSS(server) {
       log('TUNNEL sent heartbeat ping');
     }, 2000);
 
-    ws.on('message', (data, isBinary) => {
+    ws.on('message', async (data, isBinary) => {
       if (!isBinary) {
         log(`TUNNEL message received text length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
         let m = null;
@@ -295,8 +297,8 @@ function attachTunnelWSS(server) {
         }
         if (m.type === 'requestFile') {
           log('TUNNEL received file request id=' + m.id + ' file=' + m.fileName);
-          if (!m.fileName) {
-            return safeSend(ws, { type: 'error', message: 'No file name provided.' });
+          if (!m.fileName || !m.id) {
+            return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
           }
           const fileName = sanitizeFileName(m.fileName);
           const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
@@ -304,24 +306,32 @@ function attachTunnelWSS(server) {
             log(`Invalid file path: ${filePath}`);
             return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
           }
-          let buffer = FILE_CACHE.get(fileName);
-          if (!buffer) buffer = loadFileBuffer(fileName);
-          if (!buffer) {
+          let file = FILE_CACHE.get(fileName);
+          if (!file) file = await loadFileBuffer(fileName);
+          if (!file) {
             return safeSend(ws, { type: 'error', message: `File ${fileName} not found on server.` });
           }
-          currentDownload = { id: m.id, fileName, size: buffer.length, chunks: Math.ceil(buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE };
+          transfers.set(m.id, { type: 'download', id: m.id, fileName, size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash });
           try { 
-            streamFileOverWS(ws, buffer, fileName, CONFIG.CHUNK_SIZE); 
+            await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash); 
           } catch (e) { 
             safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
-            currentDownload = null;
+            transfers.delete(m.id);
           }
           return;
         }
+        if (m.type === 'ready') {
+          log('TUNNEL received ready id=' + m.id);
+          const transfer = transfers.get(m.id);
+          if (!transfer || transfer.type !== 'download') {
+            return safeSend(ws, { type: 'error', message: 'No active download for ID ' + m.id });
+          }
+          return; // Ready to receive chunks
+        }
         if (m.type === 'deleteFile') {
           log('TUNNEL received delete file request id=' + m.id + ' file=' + m.fileName);
-          if (!m.fileName) {
-            return safeSend(ws, { type: 'error', message: 'No file name provided.' });
+          if (!m.fileName || !m.id) {
+            return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
           }
           const fileName = sanitizeFileName(m.fileName);
           const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
@@ -330,7 +340,7 @@ function attachTunnelWSS(server) {
             return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
           }
           try {
-            fsp.unlink(filePath);
+            await fsp.unlink(filePath);
             FILE_CACHE.delete(fileName);
             safeSend(ws, { type: 'deleteComplete', id: m.id, fileName });
             log(`TUNNEL deleted file: ${fileName}`);
@@ -348,53 +358,62 @@ function attachTunnelWSS(server) {
           if (!m.fileName || !m.id) {
             return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
           }
+          if (m.size > CONFIG.MAX_FILE_SIZE) {
+            return safeSend(ws, { type: 'error', message: 'File too large (max 10MB)' });
+          }
           const fileName = sanitizeFileName(m.fileName);
           const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
           if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
             log(`Invalid upload path: ${filePath}`);
             return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
           }
-          currentUpload = { id: m.id, fileName, filePath, size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0 };
+          transfers.set(m.id, { type: 'upload', id: m.id, fileName, filePath, size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: m.mime || 'application/octet-stream' });
           safeSend(ws, { type: 'readyForUpload', id: m.id });
           log(`TUNNEL ready for upload id=${m.id} file=${fileName} size=${m.size}`);
           return;
         }
+        if (m.type === 'uploadChunkMeta') {
+          log(`TUNNEL received upload chunk meta id=${m.id} seq=${m.seq}`);
+          const transfer = transfers.get(m.id);
+          if (!transfer || transfer.type !== 'upload') {
+            return safeSend(ws, { type: 'error', message: 'No active upload for ID ' + m.id });
+          }
+          if (m.seq !== transfer.chunks.length) {
+            log(`TUNNEL upload chunk out of order: expected seq=${transfer.chunks.length}, got=${m.seq}`);
+            return safeSend(ws, { type: 'error', message: `Out of order chunk: expected ${transfer.chunks.length}, got ${m.seq}` });
+          }
+          return; // Ready for binary chunk
+        }
         safeSend(ws, { type: 'error', message: 'Unsupported message type' });
       } else {
-        if (!currentUpload) {
+        const transfer = Array.from(transfers.values()).find(t => t.type === 'upload' && t.chunks.length < t.totalChunks);
+        if (!transfer) {
           log('TUNNEL received unexpected binary data');
           return safeSend(ws, { type: 'error', message: 'No active upload' });
         }
-        const bytes = Buffer.from(data);
-        if (bytes.length === 0) {
-          log(`TUNNEL upload chunk empty id=${currentUpload.id} seq=${currentUpload.chunks.length}`);
-          return safeSend(ws, { type: 'error', message: 'Empty chunk received' });
-        }
-        handleFileUpload(ws, bytes, currentUpload);
+        await handleFileUpload(ws, data, transfer);
       }
     });
 
     ws.on('error', (err) => { 
       log('TUNNEL error:', err?.message || err); 
-      currentDownload = null;
-      currentUpload = null;
+      transfers.clear();
     });
     ws.on('close', (code, reason) => {
       clearInterval(appBeat);
       const r = reason && reason.toString ? reason.toString() : '';
       log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0}`);
-      currentDownload = null;
-      currentUpload = null;
+      transfers.clear();
     });
   });
 }
 
-async function streamFileOverWS(ws, buffer, name, chunkSize) {
+async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  log(`Starting stream for ${name} size=${size} mime=${getMimeType(name)} chunks=${chunks}`);
-  safeSend(ws, { type: 'fileMeta', name, mime: getMimeType(name), size, chunkSize, chunks });
+  log(`Starting stream for ${name} id=${id} size=${size} mime=${getMimeType(name)} chunks=${chunks} hash=${hash}`);
+  safeSend(ws, { type: 'fileMeta', id, name, mime: getMimeType(name), size, chunkSize, chunks, hash });
   log('TUNNEL sent fileMeta');
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
@@ -405,9 +424,11 @@ async function streamFileOverWS(ws, buffer, name, chunkSize) {
     const start = i * chunkSize;
     const end = Math.min(size, start + chunkSize);
     const slice = buffer.subarray(start, end);
-    log(`Sending chunk ${i + 1}/${chunks} bytes=${slice.length}`);
+    const chunkHash = crypto.createHash('sha256').update(slice).digest('hex');
+    log(`Sending chunk ${i + 1}/${chunks} bytes=${slice.length} hash=${chunkHash}`);
     try {
       await new Promise((resolve, reject) => {
+        safeSend(ws, { type: 'fileChunkMeta', id, seq: i, hash: chunkHash });
         ws.send(slice, { binary: true }, (err) => err ? reject(err) : resolve());
       });
       if ((i % 16) === 0 || i === chunks - 1) {
@@ -419,42 +440,44 @@ async function streamFileOverWS(ws, buffer, name, chunkSize) {
     }
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  safeSend(ws, { type: 'fileEnd', name, ok: true });
-  log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms`);
+  safeSend(ws, { type: 'fileEnd', id, name, ok: true });
+  log(`TUNNEL sent fileEnd id=${id} totalTime=${(performance.now() - start).toFixed(1)}ms`);
 }
 
-async function handleFileUpload(ws, bytes, upload) {
+async function handleFileUpload(ws, data, transfer) {
   try {
-    const seq = upload.chunks.length;
+    const bytes = Buffer.from(data);
     if (bytes.length === 0) {
-      log(`TUNNEL upload chunk empty id=${upload.id} seq=${seq}`);
+      log(`TUNNEL upload chunk empty id=${transfer.id} seq=${transfer.chunks.length}`);
       return safeSend(ws, { type: 'error', message: 'Empty chunk received' });
     }
-    upload.chunks[seq] = bytes;
-    upload.receivedBytes += bytes.length;
-    log(`TUNNEL upload chunk id=${upload.id} seq=${seq}/${upload.totalChunks} bytes=${bytes.length} total=${upload.receivedBytes}`);
-    if (seq === upload.totalChunks - 1) {
-      if (upload.receivedBytes !== upload.size) {
-        log(`TUNNEL upload failed id=${upload.id} size mismatch: expected ${upload.size}, got ${upload.receivedBytes}`);
+    const seq = transfer.chunks.length;
+    const chunkHash = crypto.createHash('sha256').update(bytes).digest('hex');
+    log(`TUNNEL upload chunk id=${transfer.id} seq=${seq}/${transfer.totalChunks} bytes=${bytes.length} hash=${chunkHash}`);
+    transfer.chunks[seq] = bytes;
+    transfer.receivedBytes += bytes.length;
+    if (seq === transfer.totalChunks - 1) {
+      if (transfer.receivedBytes !== transfer.size) {
+        log(`TUNNEL upload failed id=${transfer.id} size mismatch: expected ${transfer.size}, got ${transfer.receivedBytes}`);
         safeSend(ws, { type: 'error', message: 'Size mismatch' });
-        uploadStreams.delete(upload.id);
+        transfers.delete(transfer.id);
         return;
       }
-      const buffer = Buffer.concat(upload.chunks.filter(chunk => chunk));
-      await fsp.writeFile(upload.filePath, buffer);
-      FILE_CACHE.set(upload.fileName, buffer);
-      safeSend(ws, { type: 'uploadComplete', id: upload.id, fileName: upload.fileName, size: upload.receivedBytes });
-      log(`TUNNEL upload complete id=${upload.id} file=${upload.fileName} bytes=${upload.receivedBytes}`);
-      uploadStreams.delete(upload.id);
+      const buffer = Buffer.concat(transfer.chunks.filter(chunk => chunk));
+      const finalHash = crypto.createHash('sha256').update(buffer).digest('hex');
+      await fsp.writeFile(transfer.filePath, buffer);
+      FILE_CACHE.set(transfer.fileName, { buffer, hash: finalHash });
+      safeSend(ws, { type: 'uploadComplete', id: transfer.id, fileName: transfer.fileName, size: transfer.receivedBytes, hash: finalHash });
+      log(`TUNNEL upload complete id=${transfer.id} file=${transfer.fileName} bytes=${transfer.receivedBytes} hash=${finalHash}`);
+      transfers.delete(transfer.id);
     }
   } catch (e) {
-    log(`TUNNEL upload error id=${upload.id}: ${e?.message || e}`);
+    log(`TUNNEL upload error id=${transfer.id}: ${e?.message || e}`);
     safeSend(ws, { type: 'error', message: `Upload failed: ${e?.message || e}` });
-    uploadStreams.delete(upload.id);
+    transfers.delete(transfer.id);
   }
 }
 
-const uploadStreams = new Map();
 function attachRawSocketLogs(ws, label) {
   const s = ws._socket;
   if (!s) return;
