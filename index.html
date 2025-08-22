@@ -298,7 +298,7 @@
           const isPing = line.includes('PING') || line.includes('heartbeat');
           const isPong = line.includes('PONG');
           const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
-                                line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error');
+                                line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error') || line.includes('FILE LIST');
           const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
           const isConnection = line.includes('OPEN') || line.includes('CLOSE') || line.includes('ERROR') || line.includes('WELCOME');
           const isMessage = line.includes('SAY') || line.includes('MSG');
@@ -377,22 +377,16 @@
         setSend(ws && ws.readyState === ws.OPEN);
       }
       async function fetchFiles() {
+        if (!ws || ws.readyState !== ws.OPEN) { 
+          log('FETCH files blocked (socket not open)'); 
+          return; 
+        }
         try {
-          const res = await fetch('/files');
-          if (!res.ok) throw new Error('Failed to fetch files: ' + res.status);
-          const files = await res.json();
-          fileSelect.innerHTML = '<option value="">Select a file...</option>';
-          files.forEach(file => {
-            if (file.size > 0) {
-              const opt = document.createElement('option');
-              opt.value = file.name;
-              opt.textContent = `${file.name} (${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'})`;
-              fileSelect.appendChild(opt);
-            }
-          });
-          log('Fetched file list: ' + files.map(f => f.name).join(', '));
+          const id = Math.random().toString(36).slice(2);
+          ws.send(JSON.stringify({ type: 'listFiles', id, clientTs: Date.now() }));
+          log('Client requested file list id=' + id);
         } catch (e) {
-          log('Fetch files error: ' + e.message);
+          log('Fetch files request error: ' + e.message);
           fileSelect.innerHTML = '<option value="">No files available</option>';
         }
       }
@@ -523,6 +517,23 @@
           if (m.type === 'serverPing') { 
             log('serverPing ' + m.serverTs); 
             return; 
+          }
+          if (m.type === 'fileList') {
+            log('FILE LIST received id=' + m.id + ' files=' + (m.files ? m.files.map(f => f.name).join(', ') : 'none'));
+            fileSelect.innerHTML = '<option value="">Select a file...</option>';
+            if (m.files && Array.isArray(m.files)) {
+              m.files.forEach(file => {
+                if (file.size > 0) {
+                  const opt = document.createElement('option');
+                  opt.value = file.name;
+                  opt.textContent = `${file.name} (${file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB'})`;
+                  fileSelect.appendChild(opt);
+                }
+              });
+            } else {
+              fileSelect.innerHTML = '<option value="">No files available</option>';
+            }
+            return;
           }
           if (m.type === 'readyForUpload') {
             log('READY for upload id=' + m.id);

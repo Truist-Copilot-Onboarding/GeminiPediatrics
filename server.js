@@ -237,6 +237,13 @@ app.get('/console/clients', basicAuth, (req, res) => {
   }));
   res.status(200).json(clients);
 });
+app.get('/console/blacklist', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`BLACKLIST request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.status(200).json(Array.from(blacklistedIps));
+});
 app.post('/console/kill', basicAuth, express.json(), (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   const ua = req.headers['user-agent'] || '(unknown)';
@@ -284,6 +291,24 @@ app.post('/console/blacklist', basicAuth, express.json(), (req, res) => {
   log(`BLACKLIST IP succeeded: ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   res.status(200).type('text').send(`IP ${targetIp} blacklisted`);
 });
+app.post('/console/unblacklist', basicAuth, express.json(), (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const { ip: targetIp } = req.body;
+  log(`UNBLACKLIST IP request for ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  if (!targetIp) {
+    log(`UNBLACKLIST IP failed: No IP provided from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(400).type('text').send('IP address required');
+  }
+  if (blacklistedIps.delete(targetIp)) {
+    log(`UNBLACKLIST IP succeeded: ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.status(200).type('text').send(`IP ${targetIp} unblacklisted`);
+  } else {
+    log(`UNBLACKLIST IP failed: ip=${targetIp} not found in blacklist from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.status(404).type('text').send(`IP ${targetIp} not found in blacklist`);
+  }
+});
 
 // HTTP server
 const server = http.createServer(app);
@@ -323,10 +348,9 @@ wss.on('connection', (ws, req) => {
 
   const origin = req.headers.origin || '(null)';
   const clientId = Math.random().toString(36).slice(2);
+  const transfers = new Map();
   connectedClients.set(clientId, { ws, ip, clientId, connectedAt: Date.now() });
   log(`TUNNEL connected ip=${ip} ua="${ua}" referrer="${referrer}" origin=${origin} id=${clientId}`);
-
-  const transfers = new Map();
 
   try {
     log(`TUNNEL socket state before send: readyState=${s.readyState} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
@@ -358,6 +382,26 @@ wss.on('connection', (ws, req) => {
     if (m.type === 'ping') {
       log(`TUNNEL received client ping id=${m.id} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
+    }
+    if (m.type === 'listFiles') {
+      log(`TUNNEL received file list request id=${m.id} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+      try {
+        const files = await fsp.readdir(CONFIG.FILES_DIR);
+        const fileDetails = await Promise.all(files.map(async (file) => {
+          const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
+          if (stats.size > 0) {
+            return { name: file, size: stats.size, mime: getMimeType(file) };
+          }
+          return null;
+        }));
+        const filteredFiles = fileDetails.filter(f => f);
+        safeSend(ws, { type: 'fileList', id: m.id, files: filteredFiles });
+        log(`TUNNEL sent file list id=${m.id} files=${filteredFiles.map(f => f.name).join(', ')} to ip=${ip} ua="${ua}" referrer="${referrer}"`);
+      } catch (e) {
+        log(`ERROR listing files for id=${m.id} from ip=${ip} ua="${ua}" referrer="${referrer}":`, e?.message || e);
+        safeSend(ws, { type: 'error', message: 'Failed to list files' });
+      }
+      return;
     }
     if (m.type === 'requestFile') {
       log(`TUNNEL received file request id=${m.id} file=${m.fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
@@ -426,7 +470,7 @@ wss.on('connection', (ws, req) => {
       if (!transfer || transfer.type !== 'upload') {
         return safeSend(ws, { type: 'error', message: 'No active upload for ID ' + m.id });
       }
-      await handleFileUpload(ws, m, transfer, ip, ua, referrer);
+      await handleFileUpload(ws, m, transfer, ip, ua, referrer, transfers);
       return;
     }
     if (m.type === 'deleteFile') {
@@ -460,6 +504,7 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => { 
     log(`TUNNEL error from ip=${ip} ua="${ua}" referrer="${referrer}":`, err?.message || err); 
     transfers.clear();
+    connectedClients.delete(clientId);
   });
   ws.on('close', (code, reason) => {
     clearInterval(appBeat);
@@ -539,7 +584,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalN
   transfers.delete(id);
 }
 
-async function handleFileUpload(ws, m, transfer, ip, ua, referrer) {
+async function handleFileUpload(ws, m, transfer, ip, ua, referrer, transfers) {
   try {
     if (m.seq !== transfer.chunks.length) {
       log(`TUNNEL upload chunk out of order id=${transfer.id} seq=${m.seq}, expected=${transfer.chunks.length} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
@@ -586,7 +631,9 @@ async function handleFileUpload(ws, m, transfer, ip, ua, referrer) {
   } catch (e) {
     log(`TUNNEL upload error id=${transfer.id} from ip=${ip} ua="${ua}" referrer="${referrer}": ${e?.message || e}`);
     safeSend(ws, { type: 'error', message: `Upload failed: ${e?.message || e}` });
-    transfers.delete(transfer.id);
+    if (transfers.has(transfer.id)) {
+      transfers.delete(transfer.id);
+    }
   }
 }
 

@@ -165,6 +165,20 @@
       </div>
     </div>
     <div class="row">
+      <label>Blacklisted IPs</label>
+      <div>
+        <table id="blacklistTable">
+          <thead>
+            <tr>
+              <th>IP</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="blacklist"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="row">
       <label>Server Logs</label>
       <div>
         <div class="log-controls">
@@ -195,6 +209,7 @@
       const searchLogs = document.getElementById('searchLogs');
       const logFilter = document.getElementById('logFilter');
       const clientList = document.getElementById('clientList');
+      const blacklist = document.getElementById('blacklist');
       let logLines = [], isPaused = false;
       const MAX_LOG_LINES = 5000; // Increased for longer history
       const debounce = (fn, delay) => {
@@ -222,7 +237,7 @@
           const isPing = line.includes('PING') || line.includes('heartbeat');
           const isPong = line.includes('PONG');
           const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
-                                line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error');
+                                line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error') || line.includes('FILE LIST');
           const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
           const isConnection = line.includes('OPEN') || line.includes('CLOSE') || line.includes('ERROR') || line.includes('WELCOME');
           const isMessage = line.includes('SAY') || line.includes('MSG');
@@ -335,6 +350,7 @@
                 if (!res.ok) throw new Error('Failed to blacklist IP: ' + res.status);
                 log(`Blacklisted IP ${btn.dataset.ip}`);
                 fetchClients();
+                fetchBlacklist();
               } catch (e) {
                 log('Blacklist IP failed: ' + e.message);
               }
@@ -342,6 +358,47 @@
           });
         } catch (e) {
           log('Fetch clients error: ' + e.message);
+        }
+      }
+      async function fetchBlacklist() {
+        try {
+          const res = await fetch('/console/blacklist', {
+            headers: { 'Authorization': 'Basic ' + btoa('womprats:womprats') }
+          });
+          if (!res.ok) throw new Error('Failed to fetch blacklist: ' + res.status);
+          const ips = await res.json();
+          blacklist.innerHTML = '';
+          ips.forEach(ip => {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+              <td>${ip}</td>
+              <td>
+                <button class="blacklist-btn" data-ip="${ip}">Unblacklist</button>
+              </td>
+            `;
+            blacklist.appendChild(row);
+          });
+          blacklist.querySelectorAll('.blacklist-btn').forEach(btn => {
+            btn.onclick = async () => {
+              try {
+                const res = await fetch('/console/unblacklist', {
+                  method: 'POST',
+                  headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Basic ' + btoa('womprats:womprats')
+                  },
+                  body: JSON.stringify({ ip: btn.dataset.ip })
+                });
+                if (!res.ok) throw new Error('Failed to unblacklist IP: ' + res.status);
+                log(`Unblacklisted IP ${btn.dataset.ip}`);
+                fetchBlacklist();
+              } catch (e) {
+                log('Unblacklist IP failed: ' + e.message);
+              }
+            };
+          });
+        } catch (e) {
+          log('Fetch blacklist error: ' + e.message);
         }
       }
       const es = new EventSource('/logs');
@@ -356,7 +413,11 @@
         updateLogDisplay();
       };
       fetchClients();
-      setInterval(fetchClients, 5000); // Refresh client list every 5 seconds
+      fetchBlacklist();
+      setInterval(() => {
+        fetchClients();
+        fetchBlacklist();
+      }, 5000); // Refresh every 5 seconds
     })();
   </script>
 </body>
