@@ -116,6 +116,16 @@
       font-family: ui-monospace, monospace;
       font-size: 0.9rem;
     }
+    .log-controls {
+      position: sticky;
+      top: 0;
+      background: var(--card-bg);
+      padding: 0.5rem 0;
+      z-index: 10;
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
     progress {
       width: 100%;
       height: 1.2rem;
@@ -186,12 +196,13 @@
       <div class="row">
         <label>Client Logs</label>
         <div>
-          <pre id="log"></pre>
-          <div class="controls">
+          <div class="log-controls">
             <button id="copyLogs">Copy Logs</button>
             <button id="pauseLogs">Pause Logs</button>
+            <input id="searchLogs" placeholder="Search logs..." style="flex: 1"/>
             <label><input type="checkbox" id="filterPingPong" checked> Filter Ping/Pong</label>
           </div>
+          <pre id="log"></pre>
         </div>
       </div>
     </div>
@@ -207,6 +218,7 @@
       const reconnectBtn = document.getElementById('reconnect');
       const copyLogsBtn = document.getElementById('copyLogs');
       const pauseLogsBtn = document.getElementById('pauseLogs');
+      const searchLogs = document.getElementById('searchLogs');
       const filterPingPong = document.getElementById('filterPingPong');
       const fileSelect = document.getElementById('fileSelect');
       const downloadBtn = document.getElementById('downloadBtn');
@@ -242,10 +254,14 @@
         console.log(s); 
         logLines.push(s);
         if (logLines.length > MAX_LOG_LINES) logLines.shift();
-        if (!isPaused) {
-          logEl.textContent = logLines.join('\n'); 
-          logEl.scrollTop = logEl.scrollHeight; 
-        }
+        updateLogDisplay();
+      };
+      const updateLogDisplay = () => {
+        if (isPaused) return;
+        const searchTerm = searchLogs.value.toLowerCase();
+        const filteredLogs = searchTerm ? logLines.filter(line => line.toLowerCase().includes(searchTerm)) : logLines;
+        logEl.textContent = filteredLogs.join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
       };
       const setSend = (on) => {
         sendBtn.disabled = !on;
@@ -274,12 +290,13 @@
       pauseLogsBtn.onclick = debounce(() => {
         isPaused = !isPaused;
         pauseLogsBtn.textContent = isPaused ? 'Resume Logs' : 'Pause Logs';
-        if (!isPaused) {
-          logEl.textContent = logLines.join('\n');
-          logEl.scrollTop = logEl.scrollHeight;
-        }
+        if (!isPaused) updateLogDisplay();
         log(isPaused ? 'Logs paused' : 'Logs resumed');
       }, 500);
+      searchLogs.oninput = debounce(() => {
+        log('Search logs: ' + searchLogs.value);
+        updateLogDisplay();
+      }, 300);
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
       let rx = null, tx = null;
       function resetTransfer() { 
@@ -334,7 +351,7 @@
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
         try {
-          ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false });
+          ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
           log('WebSocket created: ' + url);
         } catch (e) {
           log('WebSocket creation failed: ' + e.message);
@@ -378,7 +395,7 @@
             } else {
               clearInterval(heartbeat);
             }
-          }, 2000);
+          }, 500);
         };
         ws.onerror = (e) => { 
           log('WebSocket error: ' + (e.message || 'Unknown error')); 
@@ -488,10 +505,7 @@
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
                 log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) id=${m.id}`);
               }
-            } catch (e) {
-              log('FILE CHUNK error: ' + e.message);
-              transferInfo.textContent = 'Download failed: ' + e.message;
-            }
+            } }
             return;
           }
           if (m.type === 'fileEnd' && rx && m.id === rx.id) {
