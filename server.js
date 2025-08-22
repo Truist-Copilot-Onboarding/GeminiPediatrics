@@ -55,7 +55,7 @@ app.get('/HelloWorld.exe', async (_req, res) => {
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/vnd.microsoft.portable-executable')
+    .setHeader('Content-Type', 'application/octet-stream')
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
@@ -287,7 +287,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize, requestId) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/vnd.microsoft.portable-executable', size, chunkSize, chunks, requestId });
+  safeSend(ws, { type: 'fileMeta', name, mime: 'application/octet-stream', size, chunkSize, chunks, requestId });
   log('TUNNEL sent fileMeta for requestId=' + requestId);
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
