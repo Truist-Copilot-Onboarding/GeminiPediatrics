@@ -147,7 +147,12 @@ app.get('/console', (req, res) => {
     header { padding: 10px 14px; background: #111; border-bottom: 1px solid #222; }
     main { padding: 10px 14px; }
     pre { white-space: pre-wrap; word-break: break-word; }
-    .log-controls { position: sticky; top: 0; background: #111; padding: 0.5rem 0; z-index: 10; display: flex; gap: 0.5rem; align-items: center; }
+    .log-controls { position: sticky; top: 0; background: #111; padding: 0.5rem 0; z-index: 10; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    input { padding: 0.5rem; border: 1px solid #ccc; border-radius: 5px; background: #fff; color: #000; }
+    @media (prefers-color-scheme: dark) {
+      input { background: #444; color: #fff; }
+    }
+    #searchLogs { max-width: 150px; }
   </style>
 </head>
 <body>
@@ -158,7 +163,7 @@ app.get('/console', (req, res) => {
   <main>
     <div class="log-controls">
       <button id="copyLogs">Copy Logs</button>
-      <input id="searchLogs" placeholder="Search logs..." style="flex: 1"/>
+      <input id="searchLogs" placeholder="Search logs..."/>
     </div>
     <pre id="out"></pre>
   </main>
@@ -311,7 +316,7 @@ wss.on('connection', (ws, req) => {
       }
       transfers.set(m.id, { type: 'download', id: m.id, fileName, originalName: m.originalName || fileName.replace(/\.zip$/, ''), size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
       try { 
-        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, m.originalName || fileName.replace(/\.zip$/, ''), ip); 
+        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, m.originalName || fileName.replace(/\.zip$/, ''), ip, transfers); 
       } catch (e) { 
         safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
         transfers.delete(m.id);
@@ -406,7 +411,7 @@ function attachRawSocketLogs(ws, label, ip) {
   s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip}`));
 }
 
-async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalName, ip) {
+async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalName, ip, transfers) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
@@ -415,6 +420,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalN
   log(`TUNNEL sent fileMeta from ip=${ip}`);
   const transfer = transfers.get(id);
   if (!transfer) {
+    log(`TUNNEL stream error: No transfer found for id=${id} from ip=${ip}`);
     throw new Error('Transfer not found for ID ' + id);
   }
   let i = 0;
@@ -437,9 +443,7 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalN
       await new Promise((resolve, reject) => {
         ws.send(JSON.stringify({ type: 'fileChunk', id, seq: i, data: b64, hash: chunkHash }), (err) => err ? reject(err) : resolve());
       });
-      if ((i % 16) === 0 || i === chunks - 1) {
-        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} hash=${chunkHash} took ${(performance.now() - chunkStart).toFixed(1)}ms from ip=${ip}`);
-      }
+      log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} hash=${chunkHash} took ${(performance.now() - chunkStart).toFixed(1)}ms from ip=${ip}`);
       i++;
     } catch (e) {
       log(`TUNNEL file chunk error from ip=${ip}: ` + e.message);
@@ -474,9 +478,7 @@ async function handleFileUpload(ws, m, transfer, ip) {
     if (m.seq === transfer.totalChunks - 1) {
       if (transfer.receivedBytes !== transfer.size) {
         log(`TUNNEL upload failed id=${transfer.id} size mismatch: expected ${transfer.size}, got ${transfer.receivedBytes} from ip=${ip}`);
-        safeSend(ws, { type: 'error', message: 'Size mismatch' });
-        transfers.delete(transfer.id);
-        return;
+        return safeSend(ws, { type: 'error', message: 'Size mismatch' });
       }
       const buffer = Buffer.concat(transfer.chunks.filter(chunk => chunk));
       const finalHash = crypto.createHash('sha256').update(buffer).digest('hex');
