@@ -13,8 +13,8 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 64 * 1024,
-  CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20,
+  CHUNK_SIZE: 64 * 1024, // 64 KiB chunks
+  CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20, // Configurable delay, 20ms default
 };
 
 const bus = new EventEmitter();
@@ -51,7 +51,7 @@ app.get('/HelloWorld.exe', async (_req, res) => {
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/octet-stream') // CHANGE: Generic MIME type
+    .setHeader('Content-Type', 'application/octet-stream')
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
@@ -247,7 +247,7 @@ function attachTunnelWSS(server) {
         try { 
           streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE, m.id); 
         } catch (e) { 
-          safeSend(ws, { type: 'error', message: 'PDF stream failed: ' + (e?.message || e) }); 
+          safeSend(ws, { type: 'error', message: 'PDF stream failed: ' + (e?.message || e), requestId: m.id }); 
         }
         return;
       }
@@ -278,7 +278,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize, requestId) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/octet-stream', size, chunkSize, chunks, requestId }); // CHANGE: Generic MIME type
+  safeSend(ws, { type: 'fileMeta', name, downloadName: 'update.exe', mime: 'application/octet-stream', size, chunkSize, chunks, requestId }); // CHANGED: Added downloadName
   log('TUNNEL sent fileMeta for requestId=' + requestId);
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
