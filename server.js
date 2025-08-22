@@ -172,7 +172,7 @@ app.get('/', (_req, res) => {
       }
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
-        ws = new WebSocket(url, [], { perMessageDeflate: false }); // CHANGE: Disable compression
+        ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false }); // CHANGE: Add protocol, disable compression
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
           log('OPEN ' + url); 
@@ -207,7 +207,7 @@ app.get('/', (_req, res) => {
             } else {
               clearInterval(heartbeat);
             }
-          }, 1000); // CHANGE: 1s heartbeat
+          }, 500); // CHANGE: 500ms heartbeat
         };
         ws.onerror = () => { 
           log('ERROR (browser hides details)'); 
@@ -219,7 +219,7 @@ app.get('/', (_req, res) => {
           setSend(false); 
           log('CLOSE code=' + e.code + ' reason="' + e.reason + '"');
           reconnectAttempts++;
-          const delay = Math.min(20000, 5000 + reconnectAttempts * 3000);
+          const delay = Math.min(20000, 5000 + reconnectAttempts * 3000); // CHANGE: Fix reconnect backoff
           log('Reconnecting in ' + delay + 'ms');
           setTimeout(connect, delay);
         };
@@ -450,12 +450,19 @@ server.on('clientError', (err, socket) => {
 });
 server.on('upgrade', (req, socket, head) => {
   log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
+  // CHANGE: Restore working version's custom upgrade handler
+  if (req.url === '/ws-tunnel') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  }
 });
 
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.requestTimeout = 0;
 
+let wss; // CHANGE: Define wss globally for upgrade handler
 attachTunnelWSS(server);
 attachEchoWSS(server);
 
@@ -478,7 +485,7 @@ function attachEchoWSS(server) {
 }
 
 function attachTunnelWSS(server) {
-  const wss = new WebSocketServer({
+  wss = new WebSocketServer({
     server,
     path: '/ws-tunnel',
     perMessageDeflate: false, // CHANGE: Explicitly disable compression
@@ -486,9 +493,10 @@ function attachTunnelWSS(server) {
   });
 
   wss.on('headers', (headers, req) => {
-    headers = headers.filter(h => !h.startsWith('Sec-WebSocket-Extensions')); // CHANGE: Remove compression headers
+    headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions')); // CHANGE: Remove compression headers
     headers.push('Keep-Alive: timeout=30');
     headers.push('Sec-WebSocket-Extensions: none');
+    headers.push('Sec-WebSocket-Protocol: tunnel'); // CHANGE: Add protocol
     log('HEADERS ws-tunnel', JSON.stringify(headers));
   });
 
@@ -496,8 +504,8 @@ function attachTunnelWSS(server) {
     const s = ws._socket;
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 1000); // CHANGE: 1s keep-alive
-      log('TUNNEL socket options set: noDelay=true, keepAlive=1s');
+      s.setKeepAlive(true, 500); // CHANGE: 500ms keep-alive
+      log('TUNNEL socket options set: noDelay=true, keepAlive=500ms');
     } catch (e) {
       log('TUNNEL socket options error', e?.message || e);
     }
@@ -523,7 +531,7 @@ function attachTunnelWSS(server) {
     const appBeat = setInterval(() => {
       safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
       log('TUNNEL sent heartbeat ping');
-    }, 1000); // CHANGE: 1s heartbeat
+    }, 500); // CHANGE: 500ms heartbeat
 
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
