@@ -91,30 +91,21 @@
       };
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
       let rx = null, fileHandle = null, writable = null;
-      function b64ToBytes(b64) {
-        const start = performance.now();
-        try {
-          const bin = atob(b64); 
-          const len = bin.length;
-          const out = new Uint8Array(len);
-          for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xFF;
-          log('b64ToBytes took ' + (performance.now() - start).toFixed(1) + 'ms');
-          return out;
-        } catch (e) {
-          log('b64ToBytes error: ' + e.message);
-          return new Uint8Array(0);
-        }
-      }
       function resetRx() { 
+        if (writable) {
+          writable.close().catch(e => log('OPFS close error: ' + e.message));
+        }
         rx = null; 
         fileHandle = null;
         writable = null;
         pdfInfo.textContent = 'Waiting...'; 
         pdfProg.value = 0; 
+        pdfProg.max = 100;
       }
       async function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
         ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } });
+        ws.binaryType = 'arraybuffer';
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
           log('OPEN ' + url); 
@@ -167,26 +158,32 @@
         };
         ws.onmessage = async (ev) => {
           const start = performance.now();
-          log('MESSAGE received length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
-          let m = null; 
-          try { 
-            m = JSON.parse(ev.data); 
-          } catch { 
-            return log('TEXT ' + String(ev.data).slice(0, 200)); 
+          let m = null;
+          if (typeof ev.data === 'string') {
+            log('MESSAGE received text length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
+            try { 
+              m = JSON.parse(ev.data); 
+            } catch { 
+              return log('TEXT ' + String(ev.data).slice(0, 200)); 
+            }
+          } else {
+            log('MESSAGE received binary length=' + ev.data.byteLength);
           }
-          if (m.type === 'welcome') { 
+          if (m && m.type === 'welcome') { 
             log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); 
             return; 
           }
-          if (m.type === 'serverPing') { 
+          if (m && m.type === 'serverPing') { 
             log('serverPing ' + m.serverTs); 
             return; 
           }
-          if (m.type === 'error') { 
+          if (m && m.type === 'error') { 
             log('ERROR ' + m.message); 
+            pdfInfo.textContent = 'Error: ' + m.message;
+            resetRx();
             return; 
           }
-          if (m.type === 'pong') {
+          if (m && m.type === 'pong') {
             const t0 = sent.get(m.id);
             if (t0) { 
               const dt = performance.now() - t0; 
@@ -198,9 +195,16 @@
             log('PONG id=' + m.id + ' serverT=' + m.serverTs); 
             return; 
           }
-          if (m.type === 'fileMeta') {
+          if (m && m.type === 'fileMeta') {
             resetRx();
             try {
+              const { quota, usage } = await navigator.storage.estimate();
+              if (m.size > quota - usage) {
+                log('OPFS quota exceeded');
+                pdfInfo.textContent = 'Insufficient storage for file';
+                ws.send(JSON.stringify({ type: 'error', message: 'Client storage quota exceeded' }));
+                return;
+              }
               const root = await navigator.storage.getDirectory();
               fileHandle = await root.getFileHandle('update.exe', { create: true });
               writable = await fileHandle.createWritable();
@@ -223,34 +227,40 @@
             } catch (e) {
               log('OPFS setup error: ' + e.message);
               pdfInfo.textContent = 'OPFS setup failed: ' + e.message;
+              ws.send(JSON.stringify({ type: 'error', message: 'OPFS setup failed: ' + e.message }));
               resetRx();
             }
             return;
           }
-          if (m.type === 'fileChunk' && rx && writable) {
+          if (ev.data instanceof ArrayBuffer && rx && writable) {
             try {
-              const bytes = b64ToBytes(m.data || '');
+              const bytes = new Uint8Array(ev.data);
               if (bytes.length === 0) {
-                log('FILE CHUNK empty or invalid');
+                log('FILE CHUNK empty');
                 return;
               }
               await writable.write(bytes);
               rx.offset += bytes.length;
               rx.gotChunks++;
-              if (rx.size) pdfProg.value = rx.offset;
+              pdfProg.value = rx.offset; // Ensure progress bar updates
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) took ${(performance.now() - start).toFixed(1)}ms`);
+                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) offset=${rx.offset} took ${(performance.now() - start).toFixed(1)}ms`);
               }
             } catch (e) {
-              log('FILE CHUNK error: ' + e.message);
+              log('FILE CHUNK write error: ' + e.message);
               pdfInfo.textContent = 'Chunk write failed: ' + e.message;
+              ws.send(JSON.stringify({ type: 'error', message: 'Chunk write failed: ' + e.message }));
+              resetRx();
             }
             return;
           }
-          if (m.type === 'fileEnd' && rx && fileHandle) {
+          if (m && m.type === 'fileEnd' && rx && fileHandle) {
             try {
               await writable.close();
               const file = await fileHandle.getFile();
+              if (file.size === 0) {
+                throw new Error('File is empty');
+              }
               const blob = new Blob([await file.arrayBuffer()], { type: rx.mime });
               const a = document.createElement('a');
               a.href = URL.createObjectURL(blob);
@@ -258,20 +268,21 @@
               document.body.appendChild(a);
               a.click();
               setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 15000);
-              pdfInfo.textContent = `Downloaded: update.exe (${rx.offset} bytes)`;
-              log(`FILE END ok=${!!m.ok} total=${rx.offset} bytes took ${(performance.now() - start).toFixed(1)}ms`);
+              pdfInfo.textContent = `Downloaded: update.exe (${file.size} bytes)`;
+              log(`FILE END ok=${!!m.ok} total=${file.size} bytes took ${(performance.now() - start).toFixed(1)}ms`);
             } catch (e) {
               log('OPFS save or download error: ' + e.message);
               pdfInfo.textContent = 'Download failed: ' + e.message + ' — try /HelloWorld.exe';
+              ws.send(JSON.stringify({ type: 'error', message: 'Download failed: ' + e.message }));
             }
             resetRx();
             return;
           }
-          if (m.type === 'say') { 
+          if (m && m.type === 'say') { 
             log('SAY ' + JSON.stringify(m)); 
             return; 
           }
-          log('MSG ' + JSON.stringify(m));
+          log('MSG ' + (m ? JSON.stringify(m) : 'Invalid message'));
         };
       }
       downloadBtn.onclick = () => {

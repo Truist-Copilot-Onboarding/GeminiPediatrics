@@ -13,8 +13,8 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 64 * 1024, // 64 KiB chunks for faster transfer
-  CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20, // CHANGE: Configurable delay, reduced to 20ms
+  CHUNK_SIZE: 64 * 1024, // 64 KiB chunks
+  CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20,
 };
 
 // Central log bus → broadcasts to SSE clients
@@ -40,8 +40,8 @@ app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 let PDF_BUFFER = null;
 async function loadPdfBufferOnce() {
   try {
-    const stats = await fsp.stat(CONFIG.PDF_PATH); // CHANGE: Check file existence
-    if (!stats.isFile()) throw new Error('Not a file');
+    const stats = await fsp.stat(CONFIG.PDF_PATH);
+    if (!stats.isFile() || stats.size === 0) throw new Error('Not a valid file');
     const b = await fsp.readFile(CONFIG.PDF_PATH);
     PDF_BUFFER = b;
     log(`File loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
@@ -245,19 +245,27 @@ function attachTunnelWSS(server) {
       }
       if (m.type === 'requestFile') {
         log('TUNNEL received file request id=' + m.id);
-        if (PDF_BUFFER && ws.readyState === ws.OPEN) {
-          try { 
-            streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE); 
-          } catch (e) { 
-            safeSend(ws, { type: 'error', message: 'PDF stream failed: ' + (e?.message || e) }); 
-          }
-        } else {
+        if (!PDF_BUFFER) {
           safeSend(ws, { type: 'error', message: 'No file configured on server. Upload to ' + CONFIG.PDF_PATH + ' or set PDF_PATH.' });
+          return;
+        }
+        if (ws.readyState !== ws.OPEN) {
+          safeSend(ws, { type: 'error', message: 'WebSocket not open' });
+          return;
+        }
+        try { 
+          streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE, m.id); 
+        } catch (e) { 
+          safeSend(ws, { type: 'error', message: 'PDF stream failed: ' + (e?.message || e) }); 
         }
         return;
       }
       if (m.type === 'ready') {
         log('TUNNEL received client ready id=' + m.id);
+        return;
+      }
+      if (m.type === 'error') {
+        log('TUNNEL received client error: ' + m.message);
         return;
       }
       if (m.type === 'say') {
@@ -275,15 +283,16 @@ function attachTunnelWSS(server) {
   });
 }
 
-async function streamPdfOverWS(ws, buffer, name, chunkSize) {
+async function streamPdfOverWS(ws, buffer, name, chunkSize, requestId) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/vnd.microsoft.portable-executable', size, chunkSize, chunks });
-  log('TUNNEL sent fileMeta');
+  safeSend(ws, { type: 'fileMeta', name, mime: 'application/vnd.microsoft.portable-executable', size, chunkSize, chunks, requestId });
+  log('TUNNEL sent fileMeta for requestId=' + requestId);
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
       log('TUNNEL stream aborted: socket closed');
+      safeSend(ws, { type: 'error', message: 'Socket closed during stream', requestId });
       throw new Error('socket closed during stream');
     }
     const chunkStart = performance.now();
@@ -292,19 +301,20 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
     const slice = buffer.subarray(start, end);
     try {
       await new Promise((resolve, reject) => {
-        ws.send(slice, { binary: true }, (err) => err ? reject(err) : resolve()); // CHANGE: Send binary data
+        ws.send(slice, { binary: true }, (err) => err ? reject(err) : resolve());
       });
       if ((i % 16) === 0 || i === chunks - 1) {
-        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} took ${(performance.now() - chunkStart).toFixed(1)}ms`);
+        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} requestId=${requestId} took ${(performance.now() - chunkStart).toFixed(1)}ms`);
       }
     } catch (e) {
-      log('TUNNEL file chunk error: ' + e.message);
+      log('TUNNEL file chunk error: ' + e.message + ' requestId=' + requestId);
+      safeSend(ws, { type: 'error', message: 'Chunk send failed: ' + e.message, requestId });
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, CONFIG.CHUNK_DELAY_MS)); // CHANGE: Use configurable delay
+    await new Promise(resolve => setTimeout(resolve, CONFIG.CHUNK_DELAY_MS));
   }
-  safeSend(ws, { type: 'fileEnd', name, ok: true });
-  log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms`);
+  safeSend(ws, { type: 'fileEnd', name, ok: true, requestId });
+  log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms requestId=${requestId}`);
 }
 
 function attachRawSocketLogs(ws, label) {
@@ -323,6 +333,8 @@ function safeSend(ws, obj) {
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify(obj));
       log('safeSend success: ' + JSON.stringify(obj).slice(0, 200));
+    } else {
+      log('safeSend skipped: socket not open');
     }
   } catch (e) { 
     log('safeSend error', e?.message || e); 
