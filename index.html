@@ -20,7 +20,7 @@
   <h1>WebSocket Tunnel (Heroku)</h1>
   <p class="muted">
     Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
-    File download: <a href="/HelloWorld.zip" target="_blank">/HelloWorld.zip</a>. <!-- CHANGE: Updated to zip -->
+    File download: <a href="/HelloWorld.exe" target="_blank">/HelloWorld.exe</a>.
   </p>
   <div class="row"><div>Endpoint</div><div><code id="ep"></code></div></div>
   <div class="row"><div>Status</div><div id="status">Connecting...</div></div>
@@ -151,100 +151,7 @@
         };
         ws.onerror = () => { 
           log('ERROR (browser hides details)'); 
-          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.zip">direct download</a>'; // CHANGE: Updated to zip
-          setSend(false);
-        };
-        ws.onclose = (e) => {
-          status.innerHTML = '<span class="bad">CLOSED</span> code=' + e.code; 
-          setSend(false); 
-          log('CLOSE code=' + e.code + ' reason="' + e.reason + '"');
-          reconnectAttempts++;
-          const delay = Math.min(20000, 5000 + reconnectAttempts * 3000);
-          log('Reconnecting in ' + delay + 'ms');
-          setTimeout(connect, delay);
-        };
-        ws.onmessage = (ev) => {
-          const start = performance.now();
-          log('MESSAGE received length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
-          let m = null; 
-          try { 
-            m = JSON.parse(ev.data); 
-          } catch { 
-            return log('TEXT ' + String(ev.data).slice(0, 200)); 
-          }
-          if (m.type === 'welcome') { 
-            log('WELCOME id=' + m.clientId + ' serverT=' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'serverPing') { 
-            log('serverPing ' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'error') { 
-            log('ERROR ' + m.message); 
-            return; 
-          }
-          if (m.type === 'pong') {
-            const t0 = sent.get(m.id);
-            if (t0) { 
-              const dt = performance.now() - t0; 
-              rtts.push(dt); 
-              if (rtts.length > 20) rtts.shift(); 
-              rttEl.textContent = mean(rtts).toFixed(1) + ' ms'; 
-              sent.delete(m.id); 
-            }
-            log('PONG id=' + m.id + ' serverT=' + m.serverTs); 
-            return; 
-          }
-          if (m.type === 'fileMeta') {
-            resetRx();
-            rx = {
-              name: m.name || 'download.bin',
-              size: Number(m.size) || 0,
-              mime: m.mime || 'application/octet-stream',
-              totalChunks: Number(m.chunks) || 0,
-              chunkSize: Number(m.chunkSize) || 0,
-              offset: 0,
-              gotChunks: 0,
-              buf: new Uint8Array(Number(m.size) || 0)
-            };
-            pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
-            pdfProg.max = rx.size || 100;
-            log('FILE META ' + JSON.stringify(m));
-            try {
-              const id = Math.random().toString(36).slice(2);
-              sent.set(id, performance.now());
-              ws.send(JSON.stringify'ping', id: id1, clientTs: Date.now() }));
-            log('Client sent initial ping id=' + id1);
-            setTimeout(() => {
-              if (ws.readyState === ws.OPEN) {
-                const id2 = Math.random().toString(36).slice(2);
-                sent.set(id2, performance.now());
-                ws.send(JSON.stringify({ type: 'ping', id: id2, clientTs: Date.now() }));
-                log('Client sent second ping id=' + id2);
-              }
-            }, 50);
-          } catch (e) { 
-            log('Client send error: ' + e.message); 
-          }
-          const heartbeat = setInterval(() => {
-            if (ws.readyState === ws.OPEN) {
-              try {
-                const id = Math.random().toString(36).slice(2);
-                sent.set(id, performance.now());
-                ws.send(JSON.stringify({ type: 'ping', id, clientTs: Date.now() }));
-                log('Client heartbeat ping id=' + id);
-              } catch (e) {
-                log('Client heartbeat error: ' + e.message);
-              }
-            } else {
-              clearInterval(heartbeat);
-            }
-          }, 500);
-        };
-        ws.onerror = () => { 
-          log('ERROR (browser hides details)'); 
-          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.zip">direct download</a>'; // CHANGE: Updated to zip
+          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.exe">direct download</a>';
           setSend(false);
         };
         ws.onclose = (e) => {
@@ -346,7 +253,7 @@
               pdfInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
             } catch (e) {
               log('DOWNLOAD trigger failed: ' + e.message);
-              pdfInfo.textContent = 'Download failed: ' + e.message + ' — try /HelloWorld.zip'; // CHANGE: Updated to zip
+              pdfInfo.textContent = 'Download failed: ' + e.message + ' — try /HelloWorld.exe';
             }
             rx = null;
             return;
