@@ -4,16 +4,108 @@
   <meta charset="utf-8">
   <title>WS Tunnel (Heroku)</title>
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui; padding: 2rem; max-width: 960px; margin: auto; }
-    .row { display: grid; grid-template-columns: 140px 1fr; gap: 0.5rem 1rem; align-items: center; }
-    .card { border: 1px solid #ccc3; padding: 12px; border-radius: 8px; margin: 12px 0; }
-    .ok { color: #0b7; } .bad { color: #b22; } .muted { opacity: 0.8; }
-    pre { background: #111; color: #0f0; padding: 12px; border-radius: 8px; white-space: pre-wrap; max-height: 260px; overflow: auto; }
-    input, button, select { font: inherit; padding: 0.45rem; }
-    button:disabled { opacity: 0.5; }
-    a { color: inherit; }
-    progress { width: 100%; }
+    :root { 
+      color-scheme: light dark; 
+      --primary: #1e90ff;
+      --success: #28a745;
+      --error: #dc3545;
+      --bg: #f8f9fa;
+      --card-bg: #fff;
+      --text: #333;
+      --muted: #6c757d;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #222;
+        --card-bg: #333;
+        --text: #ddd;
+        --muted: #aaa;
+      }
+    }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      padding: 2rem;
+      max-width: 960px;
+      margin: auto;
+      background: var(--bg);
+      color: var(--text);
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 1rem;
+      color: var(--primary);
+    }
+    .muted { color: var(--muted); }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid #ccc3;
+      border-radius: 10px;
+      padding: 1.5rem;
+      margin: 1rem 0;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    .row label {
+      width: 120px;
+      font-weight: 500;
+    }
+    .row > div { flex: 1; }
+    .controls {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    input, select, button {
+      font: inherit;
+      padding: 0.5rem 1rem;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      background: #fff;
+      color: var(--text);
+    }
+    button {
+      background: var(--primary);
+      color: white;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover:not(:disabled) {
+      background: #1c86ee;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .delete-btn {
+      background: var(--error);
+    }
+    .delete-btn:hover:not(:disabled) {
+      background: #c82333;
+    }
+    .ok { color: var(--success); }
+    .bad { color: var(--error); }
+    pre {
+      background: #1a1a1a;
+      color: #0f0;
+      padding: 1rem;
+      border-radius: 5px;
+      max-height: 300px;
+      overflow: auto;
+      font-family: ui-monospace, monospace;
+      font-size: 0.9rem;
+    }
+    progress {
+      width: 100%;
+      height: 1.2rem;
+      border-radius: 5px;
+    }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -22,33 +114,48 @@
     Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
     File download: <a href="/files/HelloWorld.zip" target="_blank">/files/HelloWorld.zip</a> (example).
   </p>
-  <div class="row"><div>Endpoint</div><div><code id="ep"></code></div></div>
-  <div class="row"><div>Status</div><div id="status">Connecting...</div></div>
-  <div class="row"><div>RTT (avg)</div><div id="rtt">--</div></div>
   <div class="card">
-    <div class="row"><div>Send</div>
-      <div>
-        <input id="msg" placeholder="Type text (or 'ping')"/>
+    <div class="row">
+      <label>Endpoint</label>
+      <div><code id="ep"></code></div>
+    </div>
+    <div class="row">
+      <label>Status</label>
+      <div id="status">Connecting...</div>
+    </div>
+    <div class="row">
+      <label>RTT (avg)</label>
+      <div id="rtt">--</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="row">
+      <label>Send Message</label>
+      <div class="controls">
+        <input id="msg" placeholder="Type text (or 'ping')" style="flex: 1"/>
         <button id="send" disabled>Send</button>
         <button id="reconnect">Reconnect</button>
       </div>
     </div>
-    <div class="row"><div>Download File</div>
-      <div>
+    <div class="row">
+      <label>File Operations</label>
+      <div class="controls">
         <select id="fileSelect" disabled>
           <option value="">Select a file...</option>
         </select>
         <button id="downloadBtn" disabled>Download</button>
-        <button id="deleteBtn" disabled>Delete</button>
+        <button id="deleteBtn" disabled class="delete-btn">Delete</button>
       </div>
     </div>
-    <div class="row"><div>Upload File</div>
-      <div>
+    <div class="row">
+      <label>Upload File</label>
+      <div class="controls">
         <input type="file" id="fileInput" disabled/>
         <button id="uploadBtn" disabled>Upload</button>
       </div>
     </div>
-    <div class="row"><div>Transfer Progress</div>
+    <div class="row">
+      <label>Transfer Progress</label>
       <div>
         <div id="transferInfo" class="muted">Waiting...</div>
         <progress id="transferProg" max="100" value="0"></progress>
@@ -56,7 +163,8 @@
     </div>
   </div>
   <div class="card">
-    <div class="row"><div>Log</div>
+    <div class="row">
+      <label>Client Logs</label>
       <div>
         <pre id="log"></pre>
         <button id="copyLogs">Copy Logs</button>
@@ -82,6 +190,25 @@
       const transferProg = document.getElementById('transferProg');
       const MAX_LOG_LINES = 100;
       const logLines = [];
+      const debounce = (fn, delay) => {
+        let timeout;
+        return (...args) => {
+          if (timeout) return;
+          timeout = setTimeout(() => {
+            fn(...args);
+            timeout = null;
+          }, delay);
+        };
+      };
+      const disableDuringTransfer = (fn) => {
+        return (...args) => {
+          if (rx || tx) {
+            log('Action blocked: transfer in progress');
+            return;
+          }
+          fn(...args);
+        };
+      };
       const log = (m) => { 
         const s = new Date().toISOString() + ' ' + m; 
         console.log(s); 
@@ -92,14 +219,14 @@
       };
       const setSend = (on) => {
         sendBtn.disabled = !on;
-        downloadBtn.disabled = !on;
+        downloadBtn.disabled = !on || (rx || tx);
         fileSelect.disabled = !on;
-        deleteBtn.disabled = !on;
-        fileInput.disabled = !on;
-        uploadBtn.disabled = !on;
+        deleteBtn.disabled = !on || (rx || tx);
+        fileInput.disabled = !on || (rx || tx);
+        uploadBtn.disabled = !on || (rx || tx);
       };
       const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-      copyLogsBtn.onclick = async () => {
+      copyLogsBtn.onclick = debounce(async () => {
         try { 
           await navigator.clipboard.writeText(logEl.textContent); 
           log('Logs copied to clipboard'); 
@@ -113,28 +240,16 @@
           t.remove();
           log('Logs copied using fallback');
         }
-      };
+      }, 500);
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
       let rx = null, tx = null;
-      function b64ToBytes(b64) {
-        const start = performance.now();
-        try {
-          const bin = atob(b64); 
-          const len = bin.length;
-          const out = new Uint8Array(len);
-          for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i);
-          log(`b64ToBytes decoded ${len} bytes took ${(performance.now() - start).toFixed(1)}ms`);
-          return out;
-        } catch (e) {
-          log('b64ToBytes error: ' + e.message);
-          return new Uint8Array(0);
-        }
-      }
       function resetTransfer() { 
         rx = null; 
         tx = null;
         transferInfo.textContent = 'Waiting...'; 
         transferProg.value = 0; 
+        transferProg.max = 100;
+        setSend(ws && ws.readyState === ws.OPEN);
       }
       async function fetchFiles() {
         try {
@@ -270,7 +385,7 @@
               buf: new Uint8Array(Number(m.size) || 0)
             };
             transferInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
-            transferProg.max = rx.size || 100;
+            transferProg.max = rx.size || 1;
             log('FILE META ' + JSON.stringify(m));
             try {
               const id = Math.random().toString(36).slice(2);
@@ -284,7 +399,7 @@
           }
           if (m.type === 'fileChunk' && rx) {
             try {
-              const bytes = b64ToBytes(m.data || '');
+              const bytes = new Uint8Array(JSON.parse(m.data));
               if (bytes.length === 0) {
                 log('FILE CHUNK empty or invalid');
                 return;
@@ -292,7 +407,7 @@
               rx.buf.set(bytes, rx.offset);
               rx.offset += bytes.length;
               rx.gotChunks++;
-              if (rx.size) transferProg.value = rx.offset;
+              transferProg.value = rx.offset;
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
                 log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) offset=${rx.offset}`);
               }
@@ -309,17 +424,18 @@
                 throw new Error(`Size mismatch: expected ${rx.size}, got ${rx.offset}`);
               }
               const blob = new Blob([rx.buf], { type: rx.mime });
+              log(`Created Blob size=${blob.size} type=${rx.mime}`);
               const a = document.createElement('a');
               a.href = URL.createObjectURL(blob);
               a.download = rx.name;
               document.body.appendChild(a);
               a.click();
-              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 15000);
+              setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 30000); // Increased timeout
               transferInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
               fetchFiles();
             } catch (e) {
               log('DOWNLOAD trigger failed: ' + e.message);
-              transferInfo.textContent = 'Download failed: ' + e.message;
+              transferInfo.textContent = 'Download failed: ' + e.message + '. Try <a href="/files/' + rx.name + '">direct download</a>.';
             }
             resetTransfer();
             return;
@@ -334,6 +450,7 @@
           if (m.type === 'deleteComplete') {
             log('DELETE COMPLETE id=' + m.id + ' file=' + m.fileName);
             transferInfo.textContent = 'Deleted: ' + m.fileName;
+            resetTransfer();
             fetchFiles();
             return;
           }
@@ -344,7 +461,7 @@
           log('MSG ' + JSON.stringify(m));
         };
       }
-      downloadBtn.onclick = () => {
+      downloadBtn.onclick = debounce(disableDuringTransfer(() => {
         if (!ws || ws.readyState !== ws.OPEN) { 
           log('DOWNLOAD blocked (socket not open)'); 
           return; 
@@ -361,8 +478,8 @@
         } catch (e) {
           log('Download request error: ' + e.message);
         }
-      };
-      deleteBtn.onclick = () => {
+      }), 500);
+      deleteBtn.onclick = debounce(disableDuringTransfer(() => {
         if (!ws || ws.readyState !== ws.OPEN) { 
           log('DELETE blocked (socket not open)'); 
           return; 
@@ -372,6 +489,10 @@
           log('DELETE blocked (no file selected)');
           return;
         }
+        if (!confirm(`Are you sure you want to delete ${fileName}?`)) {
+          log('DELETE cancelled by user');
+          return;
+        }
         try {
           const id = Math.random().toString(36).slice(2);
           ws.send(JSON.stringify({ type: 'deleteFile', id, fileName, clientTs: Date.now() }));
@@ -379,8 +500,8 @@
         } catch (e) {
           log('Delete request error: ' + e.message);
         }
-      };
-      uploadBtn.onclick = async () => {
+      }), 500);
+      uploadBtn.onclick = debounce(disableDuringTransfer(async () => {
         if (!ws || ws.readyState !== ws.OPEN) { 
           log('UPLOAD blocked (socket not open)'); 
           return; 
@@ -395,7 +516,7 @@
         const totalChunks = Math.ceil(file.size / chunkSize);
         tx = { id, fileName: file.name, size: file.size, totalChunks, chunkSize, sentChunks: 0 };
         transferInfo.textContent = `Uploading ${tx.fileName} (${tx.size} bytes) in ${tx.totalChunks} chunks...`;
-        transferProg.max = tx.size;
+        transferProg.max = tx.size || 1;
         log(`Starting upload for ${tx.fileName} size=${tx.size} chunks=${tx.totalChunks}`);
         const reader = new FileReader();
         for (let i = 0; i < totalChunks; i++) {
@@ -404,18 +525,19 @@
           const slice = file.slice(start, end);
           await new Promise((resolve) => {
             reader.onload = (e) => {
-              const b64 = e.target.result.split(',')[1] || ''; // Ensure valid base64
-              if (!b64) {
-                log(`UPLOAD chunk ${i + 1} failed: empty base64 data`);
+              const arrayBuffer = e.target.result;
+              const bytes = new Uint8Array(arrayBuffer);
+              if (bytes.length === 0) {
+                log(`UPLOAD chunk ${i + 1} failed: empty data`);
                 transferInfo.textContent = 'Upload failed: empty chunk data';
                 resetTransfer();
                 return;
               }
               try {
-                ws.send(JSON.stringify({ type: 'uploadFile', id, fileName: file.name, seq: i, data: b64, totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
+                ws.send(JSON.stringify({ type: 'uploadFile', id, fileName: file.name, seq: i, data: Array.from(bytes), totalChunks, size: file.size, mime: file.type || 'application/octet-stream', clientTs: Date.now() }));
                 tx.sentChunks++;
                 transferProg.value = end;
-                log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${end - start}B)`);
+                log(`UPLOAD chunk ${tx.sentChunks}/${tx.totalChunks} (+${bytes.length}B)`);
                 setTimeout(resolve, 50);
               } catch (e) {
                 log('UPLOAD chunk error: ' + e.message);
@@ -428,11 +550,11 @@
               transferInfo.textContent = 'Upload failed: FileReader error';
               resetTransfer();
             };
-            reader.readAsDataURL(slice);
+            reader.readAsArrayBuffer(slice);
           });
         }
-      };
-      sendBtn.onclick = () => {
+      }), 500);
+      sendBtn.onclick = debounce(() => {
         if (!ws || ws.readyState !== ws.OPEN) { 
           log('SEND blocked (socket not open)'); 
           return; 
@@ -456,11 +578,11 @@
           }
         }
         input.value = '';
-      };
-      reconnectBtn.onclick = () => { 
+      }, 500);
+      reconnectBtn.onclick = debounce(() => { 
         try { if (ws) ws.close(); } catch {} 
         connect(); 
-      };
+      }, 500);
       connect();
     })();
   </script>

@@ -69,7 +69,7 @@ async function loadFileBuffer(fileName) {
     log(`File loaded bytes=${buffer.length} from ${filePath} (name=${fileName})`);
     return buffer;
   } catch (e) {
-    log(`File not found at ${filePath}`);
+    log(`File not found at ${filePath}: ${e.message}`);
     return null;
   }
 }
@@ -86,7 +86,7 @@ app.get('/files/:fileName', async (req, res) => {
   res
     .status(200)
     .setHeader('Content-Type', getMimeType(fileName))
-    .setHeader('Content-Disposition', `inline; filename="${fileName}"`)
+    .setHeader('Content-Disposition', `attachment; filename="${fileName}"`) // Changed to attachment
     .send(buffer);
 });
 
@@ -104,7 +104,7 @@ app.delete('/files/:fileName', async (req, res) => {
     log(`File deleted: ${fileName}`);
     res.status(200).type('text').send('File deleted.');
   } catch (e) {
-    log(`ERROR deleting file ${fileName}:`, e?.message || e);
+    log(`ERROR deleting file ${fileName}: ${e?.message || e}`);
     res.status(404).type('text').send('File not found or cannot be deleted.');
   }
 });
@@ -370,11 +370,10 @@ async function streamFileOverWS(ws, buffer, name, chunkSize) {
     const start = i * chunkSize;
     const end = Math.min(size, start + chunkSize);
     const slice = buffer.subarray(start, end);
-    const b64 = slice.toString('base64');
     log(`Preparing chunk ${i + 1}/${chunks} bytes=${slice.length}`);
     try {
       await new Promise((resolve, reject) => {
-        ws.send(JSON.stringify({ type: 'fileChunk', seq: i, data: b64 }), (err) => err ? reject(err) : resolve());
+        ws.send(JSON.stringify({ type: 'fileChunk', seq: i, data: Array.from(slice) }), (err) => err ? reject(err) : resolve());
       });
       if ((i % 16) === 0 || i === chunks - 1) {
         log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} took ${(performance.now() - chunkStart).toFixed(1)}ms`);
@@ -411,7 +410,7 @@ async function handleFileUpload(ws, m, clientId) {
     log(`TUNNEL upload started id=${id} file=${sanitizedFileName} size=${size}`);
   }
   try {
-    const bytes = Buffer.from(data, 'base64');
+    const bytes = Buffer.from(data);
     if (bytes.length === 0) {
       log(`TUNNEL upload chunk empty id=${id} seq=${seq}`);
       return safeSend(ws, { type: 'error', message: 'Empty chunk received' });
@@ -426,7 +425,7 @@ async function handleFileUpload(ws, m, clientId) {
         uploadStreams.delete(id);
         return;
       }
-      const buffer = Buffer.concat(stream.chunks.filter(chunk => chunk)); // Filter out undefined
+      const buffer = Buffer.concat(stream.chunks.filter(chunk => chunk));
       await fsp.writeFile(filePath, buffer);
       FILE_CACHE.set(sanitizedFileName, buffer);
       safeSend(ws, { type: 'uploadComplete', id, fileName: sanitizedFileName, size: totalBytes });
