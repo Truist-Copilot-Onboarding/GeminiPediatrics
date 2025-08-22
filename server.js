@@ -15,7 +15,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   FILES_DIR: process.env.FILES_DIR || path.join(__dirname, 'files'),
   CHUNK_SIZE: 64 * 1024,
-  MAX_LOG_LINES: 1000, // Increased from 100 to retain more logs
+  MAX_LOG_LINES: 5000, // Increased for longer history
   MAX_FILE_SIZE: 10 * 1024 * 1024 // 10MB limit
 };
 
@@ -42,10 +42,12 @@ process.on('unhandledRejection', (e) => log('UNHANDLED_REJECTION', e?.stack || e
 
 // Basic authentication middleware
 function basicAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const authHeader = req.headers.authorization;
   if (!authHeader) {
-    log(`AUTH failed: No authorization header from ip=${ip}`);
+    log(`AUTH failed: No authorization header from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     res.setHeader('WWW-Authenticate', 'Basic realm="Restricted Area"');
     return res.status(401).type('text').send('Authentication required');
   }
@@ -53,10 +55,10 @@ function basicAuth(req, res, next) {
   const username = auth[0];
   const password = auth[1];
   if (username === 'womprats' && password === 'womprats') {
-    log(`AUTH success: User womprats authenticated from ip=${ip}`);
+    log(`AUTH success: User womprats authenticated from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     return next();
   }
-  log(`AUTH failed: Invalid credentials from ip=${ip}`);
+  log(`AUTH failed: Invalid credentials from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   res.setHeader('WWW-Authenticate', 'Basic realm="Restricted Area"');
   return res.status(401).type('text').send('Invalid credentials');
 }
@@ -71,14 +73,18 @@ app.use((req, res, next) => {
 // Health
 app.get('/healthz', (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
-  log(`HEALTH check from ip=${ip}`);
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`HEALTH check from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   res.type('text').send('ok');
 });
 
 // List files in files directory
 app.get('/files', async (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
-  log(`FILES request from ip=${ip}`);
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`FILES request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   try {
     const files = await fsp.readdir(CONFIG.FILES_DIR);
     const fileDetails = await Promise.all(files.map(async (file) => {
@@ -90,7 +96,7 @@ app.get('/files', async (req, res) => {
     }));
     res.status(200).json(fileDetails.filter(f => f));
   } catch (e) {
-    log('ERROR listing files:', e?.message || e);
+    log(`ERROR listing files from ip=${ip} ua="${ua}" referrer="${referrer}":`, e?.message || e);
     res.status(500).json({ error: 'Failed to list files' });
   }
 });
@@ -120,11 +126,13 @@ async function loadFileBuffer(fileName) {
 }
 app.get('/files/:fileName', async (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
   const fileName = sanitizeFileName(req.params.fileName);
-  log(`FILE download request for ${fileName} from ip=${ip}`);
+  log(`FILE download request for ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
   if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-    log(`Invalid file path: ${filePath}`);
+    log(`Invalid file path: ${filePath} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     return res.status(403).type('text').send('Invalid file path.');
   }
   let file = FILE_CACHE.get(fileName);
@@ -133,7 +141,7 @@ app.get('/files/:fileName', async (req, res) => {
   let finalBuffer = file.buffer;
   let finalMime = getMimeType(fileName);
   if (!file.isValidZip && finalMime !== 'application/zip') {
-    log(`Wrapping non-ZIP file ${fileName} in ZIP for direct download`);
+    log(`Wrapping non-ZIP file ${fileName} in ZIP for direct download from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     const zip = new AdmZip();
     zip.addFile(fileName, file.buffer);
     finalBuffer = zip.toBuffer();
@@ -149,20 +157,22 @@ app.get('/files/:fileName', async (req, res) => {
 // Delete file
 app.delete('/files/:fileName', async (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
   const fileName = sanitizeFileName(req.params.fileName);
-  log(`DELETE request for ${fileName} from ip=${ip}`);
+  log(`DELETE request for ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
   if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-    log(`Invalid delete path: ${filePath}`);
+    log(`Invalid delete path: ${filePath} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     return res.status(403).type('text').send('Invalid file path.');
   }
   try {
     await fsp.unlink(filePath);
     FILE_CACHE.delete(fileName);
-    log(`File deleted: ${fileName}`);
+    log(`File deleted: ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     res.status(200).type('text').send('File deleted.');
   } catch (e) {
-    log(`ERROR deleting file ${fileName}: ${e?.message || e}`);
+    log(`ERROR deleting file ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}":`, e?.message || e);
     res.status(404).type('text').send('File not found or cannot be deleted.');
   }
 });
@@ -170,10 +180,12 @@ app.delete('/files/:fileName', async (req, res) => {
 // Root tester (client interface) with basic auth
 app.get('/', basicAuth, (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
-  log(`ROOT request from ip=${ip}`);
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`ROOT request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   res.sendFile(path.join(__dirname, 'index.html'), (err) => {
     if (err) {
-      log('ERROR sending index.html:', err?.message || err);
+      log(`ERROR sending index.html from ip=${ip} ua="${ua}" referrer="${referrer}":`, err?.message || err);
       res.status(500).type('text').send('Failed to load page');
     }
   });
@@ -182,7 +194,9 @@ app.get('/', basicAuth, (req, res) => {
 // Console (SSE) with basic auth
 app.get('/console', basicAuth, (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
-  log(`CONSOLE request from ip=${ip}`);
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`CONSOLE request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -195,10 +209,11 @@ app.get('/console', basicAuth, (req, res) => {
     main { padding: 10px 14px; }
     pre { white-space: pre-wrap; word-break: break-word; }
     .log-controls { position: sticky; top: 0; background: #111; padding: 0.5rem 0; z-index: 10; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-    input { padding: 0.5rem; border: 1px solid #ccc; border-radius: 5px; background: #fff; color: #000; }
+    input, select, button { padding: 0.5rem; border: 1px solid #ccc; border-radius: 5px; background: #fff; color: #000; }
     @media (prefers-color-scheme: dark) {
-      input { background: #444; color: #fff; }
+      input, select, button { background: #444; color: #fff; }
     }
+    select { width: 200px; }
     #searchLogs { max-width: 150px; }
   </style>
 </head>
@@ -210,50 +225,126 @@ app.get('/console', basicAuth, (req, res) => {
   <main>
     <div class="log-controls">
       <button id="copyLogs">Copy Logs</button>
+      <button id="downloadLogs">Download Logs</button>
+      <button id="pauseLogs">Pause Logs</button>
       <input id="searchLogs" placeholder="Search logs..."/>
+      <select id="logFilter">
+        <option value="all">All Logs</option>
+        <option value="ping">Ping</option>
+        <option value="pong">Pong</option>
+        <option value="file-transfers">File Transfers</option>
+        <option value="errors">Errors</option>
+        <option value="connections">Connection Events</option>
+        <option value="messages">Messages</option>
+      </select>
     </div>
     <pre id="out"></pre>
   </main>
   <script>
-    const out = document.getElementById('out');
-    const copyLogsBtn = document.getElementById('copyLogs');
-    const searchLogs = document.getElementById('searchLogs');
-    let logLines = [];
-    const es = new EventSource('/logs');
-    es.onmessage = (e) => { 
-      logLines.push(e.data); 
-      if (logLines.length > 1000) logLines.shift();
-      updateLogDisplay();
-    };
-    es.onerror = () => { 
-      const line = new Date().toISOString() + " [SSE] error/closed";
-      logLines.push(line); 
-      updateLogDisplay();
-    };
-    function updateLogDisplay() {
-      const searchTerm = searchLogs.value.toLowerCase();
-      const filteredLogs = searchTerm ? logLines.filter(line => line.toLowerCase().includes(searchTerm)) : logLines;
-      out.textContent = filteredLogs.join("\n"); 
-      out.scrollTop = out.scrollHeight;
-    }
-    copyLogsBtn.onclick = async () => {
-      try { 
-        await navigator.clipboard.writeText(out.textContent); 
-        logLines.push(new Date().toISOString() + " Logs copied");
+    (function() {
+      const out = document.getElementById('out');
+      const copyLogsBtn = document.getElementById('copyLogs');
+      const downloadLogsBtn = document.getElementById('downloadLogs');
+      const pauseLogsBtn = document.getElementById('pauseLogs');
+      const searchLogs = document.getElementById('searchLogs');
+      const logFilter = document.getElementById('logFilter');
+      let logLines = [], isPaused = false;
+      const debounce = (fn, delay) => {
+        let timeout;
+        return (...args) => {
+          if (timeout) clearTimeout(timeout);
+          timeout = setTimeout(() => {
+            fn(...args);
+            timeout = null;
+          }, delay);
+        };
+      };
+      const log = (m) => {
+        const s = new Date().toISOString() + ' [CONSOLE] ' + m;
+        console.log(s);
+        logLines.push(s);
+        if (logLines.length > 5000) logLines.shift();
         updateLogDisplay();
-      } catch (e) {
-        logLines.push(new Date().toISOString() + " Copy failed: " + e.message);
-        const t = document.createElement('textarea'); 
-        t.value = out.textContent; 
-        document.body.appendChild(t); 
-        t.select(); 
-        document.execCommand('copy'); 
-        t.remove();
-        logLines.push(new Date().toISOString() + " Logs copied (fallback)");
+      };
+      const updateLogDisplay = debounce(() => {
+        if (isPaused) return;
+        const searchTerm = searchLogs.value.toLowerCase();
+        const selectedFilter = logFilter.value;
+        const filteredLogs = logLines.filter(line => {
+          const isPing = line.includes('PING');
+          const isPong = line.includes('PONG');
+          const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
+                                line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error');
+          const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
+          const isConnection = line.includes('OPEN') || line.includes('CLOSE') || line.includes('ERROR') || line.includes('WELCOME');
+          const isMessage = line.includes('SAY') || line.includes('MSG');
+          if (selectedFilter === 'all') return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
+          if (selectedFilter === 'ping') return isPing && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'pong') return isPong && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'file-transfers') return isFileTransfer && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'errors') return isError && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'connections') return isConnection && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'messages') return isMessage && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          return true;
+        });
+        out.textContent = filteredLogs.join('\n');
+        out.scrollTop = out.scrollHeight;
+      }, 100);
+      copyLogsBtn.onclick = async () => {
+        try { 
+          await navigator.clipboard.writeText(out.textContent); 
+          log('Logs copied to clipboard'); 
+        } catch (e) {
+          log('Copy failed: ' + e.message);
+          const t = document.createElement('textarea'); 
+          t.value = out.textContent; 
+          document.body.appendChild(t); 
+          t.select(); 
+          document.execCommand('copy'); 
+          t.remove();
+          log('Logs copied using fallback');
+        }
+      };
+      downloadLogsBtn.onclick = () => {
+        try {
+          const blob = new Blob([logLines.join('\n')], { type: 'text/plain' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = `console_logs_${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000);
+          log('Logs downloaded as file');
+        } catch (e) {
+          log('Download logs failed: ' + e.message);
+        }
+      };
+      pauseLogsBtn.onclick = () => {
+        isPaused = !isPaused;
+        pauseLogsBtn.textContent = isPaused ? 'Resume Logs' : 'Pause Logs';
+        if (!isPaused) updateLogDisplay();
+        log(isPaused ? 'Logs paused' : 'Logs resumed');
+      };
+      searchLogs.oninput = () => {
+        log('Search logs: ' + searchLogs.value);
         updateLogDisplay();
-      }
-    };
-    searchLogs.oninput = () => updateLogDisplay();
+      };
+      logFilter.onchange = () => {
+        log('Log filter changed to: ' + logFilter.value);
+        updateLogDisplay();
+      };
+      const es = new EventSource('/logs');
+      es.onopen = () => log('SSE connection opened');
+      es.onmessage = (e) => { 
+        logLines.push(e.data); 
+        if (logLines.length > 5000) logLines.shift();
+        updateLogDisplay();
+      };
+      es.onerror = () => { 
+        log('SSE connection error or closed');
+        updateLogDisplay();
+      };
+    })();
   </script>
 </body>
 </html>
@@ -262,22 +353,31 @@ app.get('/console', basicAuth, (req, res) => {
 
 app.get('/logs', (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
-  log(`LOGS SSE connected from ip=${ip}`);
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`LOGS SSE connected from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Keep-Alive', 'timeout=30');
   res.flushHeaders?.();
-  const send = (line) => res.write(`data: ${line}\n\n`);
+  const send = (line) => {
+    try {
+      res.write(`data: ${line}\n\n`);
+    } catch (e) {
+      log(`SSE send error from ip=${ip} ua="${ua}" referrer="${referrer}": ${e.message}`);
+    }
+  };
   const onLine = (line) => send(line);
   logLines.forEach(line => send(line));
   bus.on('line', onLine);
   send(`${new Date().toISOString()} - [SSE] connected from ip=${ip}`);
   const iv = setInterval(() => send(`${new Date().toISOString()} - [SSE] keepalive`), 10000);
   req.on('close', () => { 
-    log(`LOGS SSE closed from ip=${ip}`);
+    log(`LOGS SSE closed from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     clearInterval(iv); 
     bus.off('line', onLine); 
+    res.end();
   });
 });
 
@@ -289,52 +389,55 @@ const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 wss.on('headers', (headers, req) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
   headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
   headers.push('Sec-WebSocket-Extensions: none');
-  log(`HEADERS ws-tunnel from ip=${ip}`, JSON.stringify(headers));
+  log(`HEADERS ws-tunnel from ip=${ip} ua="${ua}" referrer="${referrer}"`, JSON.stringify(headers));
 });
 
 wss.on('connection', (ws, req) => {
   const s = ws._socket;
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
   try { 
     s.setNoDelay(true); 
     s.setKeepAlive(true, 500);
-    log(`TUNNEL socket options set: noDelay=true, keepAlive=500ms from ip=${ip}`);
+    log(`TUNNEL socket options set: noDelay=true, keepAlive=500ms from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   } catch (e) {
-    log(`TUNNEL socket options error from ip=${ip}`, e?.message || e);
+    log(`TUNNEL socket options error from ip=${ip} ua="${ua}" referrer="${referrer}"`, e?.message || e);
   }
 
-  attachRawSocketLogs(ws, 'TUNNEL', ip);
+  attachRawSocketLogs(ws, 'TUNNEL', ip, ua, referrer);
 
   const origin = req.headers.origin || '(null)';
-  const ua = req.headers['user-agent'] || '(ua?)';
   const clientId = Math.random().toString(36).slice(2);
-  log(`TUNNEL connected ip=${ip} origin=${origin} ua="${ua}" id=${clientId}`);
+  log(`TUNNEL connected ip=${ip} ua="${ua}" referrer="${referrer}" origin=${origin} id=${clientId}`);
 
   const transfers = new Map();
 
   try {
-    log(`TUNNEL socket state before send: readyState=${s.readyState} from ip=${ip}`);
+    log(`TUNNEL socket state before send: readyState=${s.readyState} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     ws.send(JSON.stringify({ type: 'welcome', clientId, serverTs: Date.now() }));
-    log(`TUNNEL sent welcome to ip=${ip}`);
+    log(`TUNNEL sent welcome to ip=${ip} ua="${ua}" referrer="${referrer}"`);
     ws.send(JSON.stringify({ type: 'ping', id: 'server-init', serverTs: Date.now() }));
-    log(`TUNNEL sent initial ping to ip=${ip}`);
+    log(`TUNNEL sent initial ping to ip=${ip} ua="${ua}" referrer="${referrer}"`);
   } catch (e) {
-    log(`TUNNEL initial send error to ip=${ip}`, e?.message || e);
+    log(`TUNNEL initial send error to ip=${ip} ua="${ua}" referrer="${referrer}"`, e?.message || e);
   }
 
   const appBeat = setInterval(() => {
     safeSend(ws, { type: 'serverPing', serverTs: Date.now() });
-    log(`TUNNEL sent heartbeat ping to ip=${ip}`);
+    log(`TUNNEL sent heartbeat ping to ip=${ip} ua="${ua}" referrer="${referrer}"`);
   }, 2000);
 
   ws.on('message', async (data, isBinary) => {
     if (isBinary) {
-      log(`TUNNEL received unexpected binary data from ip=${ip}`);
+      log(`TUNNEL received unexpected binary data from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       return safeSend(ws, { type: 'error', message: 'Binary data not supported' });
     }
-    log(`TUNNEL message received length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip}`);
+    log(`TUNNEL message received length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     let m = null;
     try { 
       m = JSON.parse(data.toString('utf8')); 
@@ -342,18 +445,18 @@ wss.on('connection', (ws, req) => {
       return safeSend(ws, { type: 'say', text: String(data).slice(0, 200), serverTs: Date.now() });
     }
     if (m.type === 'ping') {
-      log(`TUNNEL received client ping id=${m.id} from ip=${ip}`);
+      log(`TUNNEL received client ping id=${m.id} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       return safeSend(ws, { type: 'pong', id: m.id || null, clientTs: m.clientTs || null, serverTs: Date.now() });
     }
     if (m.type === 'requestFile') {
-      log(`TUNNEL received file request id=${m.id} file=${m.fileName} from ip=${ip}`);
+      log(`TUNNEL received file request id=${m.id} file=${m.fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       if (!m.fileName || !m.id) {
         return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
       }
       const fileName = sanitizeFileName(m.fileName);
       const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
       if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-        log(`Invalid file path: ${filePath} from ip=${ip}`);
+        log(`Invalid file path: ${filePath} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
         return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
       }
       let file = FILE_CACHE.get(fileName);
@@ -363,7 +466,7 @@ wss.on('connection', (ws, req) => {
       }
       transfers.set(m.id, { type: 'download', id: m.id, fileName, originalName: fileName, size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
       try { 
-        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, fileName, ip, transfers, file.isValidZip); 
+        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, fileName, ip, transfers, file.isValidZip, ua, referrer); 
       } catch (e) { 
         safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
         transfers.delete(m.id);
@@ -371,7 +474,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
     if (m.type === 'ready') {
-      log(`TUNNEL received ready id=${m.id} from ip=${ip}`);
+      log(`TUNNEL received ready id=${m.id} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       const transfer = transfers.get(m.id);
       if (!transfer || transfer.type !== 'download') {
         return safeSend(ws, { type: 'error', message: 'No active download for ID ' + m.id });
@@ -380,7 +483,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
     if (m.type === 'uploadFileMeta') {
-      log(`TUNNEL received upload file meta id=${m.id} file=${m.fileName} from ip=${ip}`);
+      log(`TUNNEL received upload file meta id=${m.id} file=${m.fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       if (!m.fileName || !m.id) {
         return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
       }
@@ -388,12 +491,6 @@ wss.on('connection', (ws, req) => {
         return safeSend(ws, { type: 'error', message: 'File too large (max 10MB)' });
       }
       let fileName = sanitizeFileName(m.fileName);
-      const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
-      if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-        log(`Invalid upload path: ${filePath} from ip=${ip}`);
-        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
-      }
-      // Check for existing file and append number if necessary
       let finalFileName = fileName;
       let counter = 1;
       while (fs.existsSync(path.join(CONFIG.FILES_DIR, finalFileName))) {
@@ -403,38 +500,42 @@ wss.on('connection', (ws, req) => {
         counter++;
       }
       const finalFilePath = path.join(CONFIG.FILES_DIR, finalFileName);
+      if (!finalFilePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
+        log(`Invalid upload path: ${finalFilePath} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+        return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
+      }
       transfers.set(m.id, { type: 'upload', id: m.id, fileName: finalFileName, filePath: finalFilePath, originalName: m.originalName || finalFileName.replace(/\.zip$/, ''), size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: 'application/zip' });
       safeSend(ws, { type: 'readyForUpload', id: m.id, fileName: finalFileName });
-      log(`TUNNEL ready for upload id=${m.id} file=${finalFileName} size=${m.size} from ip=${ip}`);
+      log(`TUNNEL ready for upload id=${m.id} file=${finalFileName} size=${m.size} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       return;
     }
     if (m.type === 'uploadFile') {
-      log(`TUNNEL received upload file chunk id=${m.id} seq=${m.seq} from ip=${ip}`);
+      log(`TUNNEL received upload file chunk id=${m.id} seq=${m.seq} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       const transfer = transfers.get(m.id);
       if (!transfer || transfer.type !== 'upload') {
         return safeSend(ws, { type: 'error', message: 'No active upload for ID ' + m.id });
       }
-      await handleFileUpload(ws, m, transfer, ip);
+      await handleFileUpload(ws, m, transfer, ip, ua, referrer);
       return;
     }
     if (m.type === 'deleteFile') {
-      log(`TUNNEL received delete file request id=${m.id} file=${m.fileName} from ip=${ip}`);
+      log(`TUNNEL received delete file request id=${m.id} file=${m.fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       if (!m.fileName || !m.id) {
         return safeSend(ws, { type: 'error', message: 'Missing file name or ID' });
       }
       const fileName = sanitizeFileName(m.fileName);
       const filePath = path.resolve(CONFIG.FILES_DIR, fileName);
       if (!filePath.startsWith(path.resolve(CONFIG.FILES_DIR))) {
-        log(`Invalid delete path: ${filePath} from ip=${ip}`);
+        log(`Invalid delete path: ${filePath} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
         return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
       }
       try {
         await fsp.unlink(filePath);
         FILE_CACHE.delete(fileName);
         safeSend(ws, { type: 'deleteComplete', id: m.id, fileName });
-        log(`TUNNEL deleted file: ${fileName} from ip=${ip}`);
+        log(`TUNNEL deleted file: ${fileName} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       } catch (e) {
-        log(`TUNNEL delete error: ${e?.message || e} from ip=${ip}`);
+        log(`TUNNEL delete error from ip=${ip} ua="${ua}" referrer="${referrer}": ${e?.message || e}`);
         safeSend(ws, { type: 'error', message: `Delete failed: ${e?.message || e}` });
       }
       return;
@@ -446,36 +547,36 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('error', (err) => { 
-    log(`TUNNEL error from ip=${ip}:`, err?.message || err); 
+    log(`TUNNEL error from ip=${ip} ua="${ua}" referrer="${referrer}":`, err?.message || err); 
     transfers.clear();
   });
   ws.on('close', (code, reason) => {
     clearInterval(appBeat);
     const r = reason && reason.toString ? reason.toString() : '';
-    log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0} from ip=${ip}`);
+    log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     transfers.clear();
   });
 });
 
-function attachRawSocketLogs(ws, label, ip) {
+function attachRawSocketLogs(ws, label, ip, ua, referrer) {
   const s = ws._socket;
   if (!s) return;
   try { s.setNoDelay(true); } catch {}
-  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState} from ip=${ip}`));
-  s.on('end', () => log(`${label} RAW end socketState=${s.readyState} from ip=${ip}`));
-  s.on('error', (e) => log(`${label} RAW error from ip=${ip}`, e?.code || '', e?.message || e));
-  s.on('timeout', () => log(`${label} RAW timeout from ip=${ip}`));
-  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip}`));
+  s.on('close', (hadErr) => log(`${label} RAW close hadErr=${hadErr} socketState=${s.readyState} from ip=${ip} ua="${ua}" referrer="${referrer}"`));
+  s.on('end', () => log(`${label} RAW end socketState=${s.readyState} from ip=${ip} ua="${ua}" referrer="${referrer}"`));
+  s.on('error', (e) => log(`${label} RAW error from ip=${ip} ua="${ua}" referrer="${referrer}"`, e?.code || '', e?.message || e));
+  s.on('timeout', () => log(`${label} RAW timeout from ip=${ip} ua="${ua}" referrer="${referrer}"`));
+  s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip} ua="${ua}" referrer="${referrer}"`));
 }
 
-async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalName, ip, transfers, isValidZip) {
+async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalName, ip, transfers, isValidZip, ua, referrer) {
   const start = performance.now();
   let finalBuffer = buffer;
   let finalHash = hash;
   let finalMime = getMimeType(name);
 
   if (!isValidZip && finalMime !== 'application/zip') {
-    log(`Wrapping non-ZIP file ${name} in ZIP for WebSocket transfer from ip=${ip}`);
+    log(`Wrapping non-ZIP file ${name} in ZIP for WebSocket transfer from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     const zip = new AdmZip();
     zip.addFile(originalName, buffer);
     finalBuffer = zip.toBuffer();
@@ -485,18 +586,18 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalN
 
   const size = finalBuffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  log(`Starting stream for ${name} id=${id} size=${size} mime=${finalMime} chunks=${chunks} hash=${finalHash} from ip=${ip}`);
+  log(`Starting stream for ${name} id=${id} size=${size} mime=${finalMime} chunks=${chunks} hash=${finalHash} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   safeSend(ws, { type: 'fileMeta', id, name, originalName, mime: finalMime, size, chunkSize, chunks, hash: finalHash });
-  log(`TUNNEL sent fileMeta from ip=${ip}`);
+  log(`TUNNEL sent fileMeta from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   const transfer = transfers.get(id);
   if (!transfer) {
-    log(`TUNNEL stream error: No transfer found for id=${id} from ip=${ip}`);
+    log(`TUNNEL stream error: No transfer found for id=${id} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     throw new Error('Transfer not found for ID ' + id);
   }
   let i = 0;
   while (i < chunks) {
     if (ws.readyState !== ws.OPEN) {
-      log(`TUNNEL stream aborted: socket closed from ip=${ip}`);
+      log(`TUNNEL stream aborted: socket closed from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       throw new Error('socket closed during stream');
     }
     if (!transfer.ready) {
@@ -513,65 +614,65 @@ async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalN
       await new Promise((resolve, reject) => {
         ws.send(JSON.stringify({ type: 'fileChunk', id, seq: i, data: b64, hash: chunkHash }), (err) => err ? reject(err) : resolve());
       });
-      log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} hash=${chunkHash} took ${(performance.now() - chunkStart).toFixed(1)}ms from ip=${ip}`);
+      log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} hash=${chunkHash} took ${(performance.now() - chunkStart).toFixed(1)}ms from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       i++;
     } catch (e) {
-      log(`TUNNEL file chunk error from ip=${ip}: ` + e.message);
+      log(`TUNNEL file chunk error from ip=${ip} ua="${ua}" referrer="${referrer}": ` + e.message);
       throw e;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   safeSend(ws, { type: 'fileEnd', id, name, ok: true });
-  log(`TUNNEL sent fileEnd id=${id} totalTime=${(performance.now() - start).toFixed(1)}ms from ip=${ip}`);
+  log(`TUNNEL sent fileEnd id=${id} totalTime=${(performance.now() - start).toFixed(1)}ms from ip=${ip} ua="${ua}" referrer="${referrer}"`);
   transfers.delete(id);
 }
 
-async function handleFileUpload(ws, m, transfer, ip) {
+async function handleFileUpload(ws, m, transfer, ip, ua, referrer) {
   try {
     if (m.seq !== transfer.chunks.length) {
-      log(`TUNNEL upload chunk out of order id=${transfer.id} seq=${m.seq}, expected=${transfer.chunks.length} from ip=${ip}`);
+      log(`TUNNEL upload chunk out of order id=${transfer.id} seq=${m.seq}, expected=${transfer.chunks.length} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       return safeSend(ws, { type: 'error', message: `Out of order chunk: expected ${transfer.chunks.length}, got ${m.seq}` });
     }
     const bytes = Buffer.from(m.data, 'base64');
     if (bytes.length === 0) {
-      log(`TUNNEL upload chunk empty id=${transfer.id} seq=${m.seq} from ip=${ip}`);
+      log(`TUNNEL upload chunk empty id=${transfer.id} seq=${m.seq} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       return safeSend(ws, { type: 'error', message: 'Empty chunk received' });
     }
     const chunkHash = crypto.createHash('sha256').update(bytes).digest('hex');
     if (chunkHash !== m.hash) {
-      log(`TUNNEL upload chunk hash mismatch id=${transfer.id} seq=${m.seq} expected=${m.hash}, got=${chunkHash} from ip=${ip}`);
+      log(`TUNNEL upload chunk hash mismatch id=${transfer.id} seq=${m.seq} expected=${m.hash}, got=${chunkHash} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       return safeSend(ws, { type: 'error', message: 'Chunk hash mismatch' });
     }
     transfer.chunks[m.seq] = bytes;
     transfer.receivedBytes += bytes.length;
-    log(`TUNNEL upload chunk id=${transfer.id} seq=${m.seq}/${transfer.totalChunks} bytes=${bytes.length} hash=${chunkHash} from ip=${ip}`);
+    log(`TUNNEL upload chunk id=${transfer.id} seq=${m.seq}/${transfer.totalChunks} bytes=${bytes.length} hash=${chunkHash} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
     if (m.seq === transfer.totalChunks - 1) {
       if (transfer.receivedBytes !== transfer.size) {
-        log(`TUNNEL upload failed id=${transfer.id} size mismatch: expected ${transfer.size}, got ${transfer.receivedBytes} from ip=${ip}`);
+        log(`TUNNEL upload failed id=${transfer.id} size mismatch: expected ${transfer.size}, got ${transfer.receivedBytes} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
         return safeSend(ws, { type: 'error', message: 'Size mismatch' });
       }
       const buffer = Buffer.concat(transfer.chunks.filter(chunk => chunk));
       const finalHash = crypto.createHash('sha256').update(buffer).digest('hex');
       if (finalHash !== m.hash) {
-        log(`TUNNEL upload final hash mismatch id=${transfer.id} expected=${m.hash}, got=${finalHash} from ip=${ip}`);
+        log(`TUNNEL upload final hash mismatch id=${transfer.id} expected=${m.hash}, got=${finalHash} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
         return safeSend(ws, { type: 'error', message: 'Final hash mismatch' });
       }
       const zip = new AdmZip(buffer);
       const entries = zip.getEntries();
       const entry = entries.find(e => e.entryName === transfer.originalName);
       if (!entry) {
-        log(`TUNNEL upload failed: file ${transfer.originalName} not found in zip from ip=${ip}`);
+        log(`TUNNEL upload failed: file ${transfer.originalName} not found in zip from ip=${ip} ua="${ua}" referrer="${referrer}"`);
         return safeSend(ws, { type: 'error', message: 'File not found in zip' });
       }
       const filePath = transfer.filePath;
       await fsp.writeFile(filePath, buffer); // Store as zip
       FILE_CACHE.set(transfer.fileName, { buffer, hash: finalHash });
       safeSend(ws, { type: 'uploadComplete', id: transfer.id, fileName: transfer.fileName, size: transfer.receivedBytes, hash: finalHash });
-      log(`TUNNEL upload complete id=${transfer.id} file=${transfer.fileName} bytes=${transfer.receivedBytes} hash=${finalHash} from ip=${ip}`);
+      log(`TUNNEL upload complete id=${transfer.id} file=${transfer.fileName} bytes=${transfer.receivedBytes} hash=${finalHash} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
       transfers.delete(transfer.id);
     }
   } catch (e) {
-    log(`TUNNEL upload error id=${transfer.id} from ip=${ip}: ${e?.message || e}`);
+    log(`TUNNEL upload error id=${transfer.id} from ip=${ip} ua="${ua}" referrer="${referrer}": ${e?.message || e}`);
     safeSend(ws, { type: 'error', message: `Upload failed: ${e?.message || e}` });
     transfers.delete(transfer.id);
   }

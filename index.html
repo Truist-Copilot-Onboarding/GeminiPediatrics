@@ -92,8 +92,7 @@
         color: #fff; /* High contrast */
       }
     }
-    select[multiple] {
-      height: 150px; /* Adjusted for more options */
+    select {
       width: 200px;
     }
     input[type="file"]::-webkit-file-upload-button {
@@ -227,11 +226,10 @@
             <button id="downloadLogs">Download Logs</button>
             <button id="pauseLogs">Pause Logs</button>
             <input id="searchLogs" placeholder="Search logs..."/>
-            <select id="logFilter" multiple>
+            <select id="logFilter">
               <option value="all">All Logs</option>
               <option value="ping">Ping</option>
               <option value="pong">Pong</option>
-              <option value="heartbeat">Heartbeat</option>
               <option value="file-transfers">File Transfers</option>
               <option value="errors">Errors</option>
               <option value="connections">Connection Events</option>
@@ -264,12 +262,12 @@
       const uploadBtn = document.getElementById('uploadBtn');
       const transferInfo = document.getElementById('transferInfo');
       const transferProg = document.getElementById('transferProg');
-      const MAX_LOG_LINES = 1000; // Increased from 100 to retain more logs
+      const MAX_LOG_LINES = 5000; // Increased for longer history
       let logLines = [], isPaused = false;
       const debounce = (fn, delay) => {
         let timeout;
         return (...args) => {
-          if (timeout) return;
+          if (timeout) clearTimeout(timeout);
           timeout = setTimeout(() => {
             fn(...args);
             timeout = null;
@@ -292,41 +290,30 @@
         if (logLines.length > MAX_LOG_LINES) logLines.shift();
         updateLogDisplay();
       };
-      const updateLogDisplay = () => {
+      const updateLogDisplay = debounce(() => {
         if (isPaused) return;
         const searchTerm = searchLogs.value.toLowerCase();
-        const selectedFilters = Array.from(logFilter.selectedOptions).map(opt => opt.value);
-        if (selectedFilters.includes('all')) {
-          // Deselect all other options when "All Logs" is selected
-          Array.from(logFilter.options).forEach(opt => {
-            if (opt.value !== 'all') opt.selected = false;
-          });
-        }
-        const filters = selectedFilters.filter(f => f !== 'all');
+        const selectedFilter = logFilter.value;
         const filteredLogs = logLines.filter(line => {
           const isPing = line.includes('PING');
           const isPong = line.includes('PONG');
-          const isHeartbeat = line.includes('serverPing') || line.includes('heartbeat');
           const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
                                 line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error');
           const isError = line.includes('ERROR') || line.includes('failed') || line.includes('mismatch');
           const isConnection = line.includes('OPEN') || line.includes('CLOSE') || line.includes('ERROR') || line.includes('WELCOME');
           const isMessage = line.includes('SAY') || line.includes('MSG');
-          if (selectedFilters.includes('all') || filters.length === 0) {
-            return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
-          }
-          return (filters.includes('ping') && isPing) ||
-                 (filters.includes('pong') && isPong) ||
-                 (filters.includes('heartbeat') && isHeartbeat) ||
-                 (filters.includes('file-transfers') && isFileTransfer) ||
-                 (filters.includes('errors') && isError) ||
-                 (filters.includes('connections') && isConnection) ||
-                 (filters.includes('messages') && isMessage) &&
-                 (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'all') return searchTerm ? line.toLowerCase().includes(searchTerm) : true;
+          if (selectedFilter === 'ping') return isPing && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'pong') return isPong && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'file-transfers') return isFileTransfer && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'errors') return isError && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'connections') return isConnection && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          if (selectedFilter === 'messages') return isMessage && (searchTerm ? line.toLowerCase().includes(searchTerm) : true);
+          return true;
         });
         logEl.textContent = filteredLogs.join('\n');
         logEl.scrollTop = logEl.scrollHeight;
-      };
+      }, 100);
       const setSend = (on) => {
         sendBtn.disabled = !on;
         downloadBtn.disabled = !on || (rx || tx);
@@ -376,7 +363,7 @@
         updateLogDisplay();
       }, 300);
       logFilter.onchange = () => {
-        log('Log filters updated: ' + Array.from(logFilter.selectedOptions).map(opt => opt.value).join(', '));
+        log('Log filter changed to: ' + logFilter.value);
         updateLogDisplay();
       };
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
