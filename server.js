@@ -11,8 +11,8 @@ const path = require('path');
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
-  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
-  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
+  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.zip',
+  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'),
   CHUNK_SIZE: 64 * 1024, // CHANGE: 64 KiB chunks for faster transfer
 };
 
@@ -47,12 +47,12 @@ async function loadPdfBufferOnce() {
     log(`File not found at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
   }
 }
-app.get('/HelloWorld.exe', async (_req, res) => {
+app.get('/HelloWorld.zip', async (_req, res) => {
   if (!PDF_BUFFER) await loadPdfBufferOnce();
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/vnd.microsoft.portable-executable')
+    .setHeader('Content-Type', 'application/zip')
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
@@ -270,7 +270,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, mime: 'application/vnd.microsoft.portable-executable', size, chunkSize, chunks });
+  safeSend(ws, { type: 'fileMeta', name, mime: 'application/zip', size, chunkSize, chunks });
   log('TUNNEL sent fileMeta');
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {

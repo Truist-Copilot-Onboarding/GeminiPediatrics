@@ -20,7 +20,7 @@
   <h1>WebSocket Tunnel (Heroku)</h1>
   <p class="muted">
     Connects to <code>/ws-tunnel</code>. Echo at <code>/ws-echo</code>. Live logs at <a href="/console" target="_blank">/console</a>.<br>
-    File download: <a href="/HelloWorld.exe" target="_blank">/HelloWorld.exe</a>.
+    File download: <a href="/HelloWorld.zip" target="_blank">/HelloWorld.zip</a>.
   </p>
   <div class="row"><div>Endpoint</div><div><code id="ep"></code></div></div>
   <div class="row"><div>Status</div><div id="status">Connecting...</div></div>
@@ -151,7 +151,7 @@
         };
         ws.onerror = () => { 
           log('ERROR (browser hides details)'); 
-          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.exe">direct download</a>';
+          status.innerHTML = '<span class="bad">ERROR</span> - Check logs or try <a href="/HelloWorld.zip">direct download</a>';
           setSend(false);
         };
         ws.onclose = (e) => {
@@ -253,7 +253,7 @@
               pdfInfo.textContent = 'Downloaded: ' + rx.name + ' (' + rx.offset + ' bytes)';
             } catch (e) {
               log('DOWNLOAD trigger failed: ' + e.message);
-              pdfInfo.textContent = 'Download failed: ' + e.message + ' — try /HelloWorld.exe';
+              pdfInfo.textContent = 'Download failed: ' + e.message + ' — try /HelloWorld.zip';
             }
             rx = null;
             return;
