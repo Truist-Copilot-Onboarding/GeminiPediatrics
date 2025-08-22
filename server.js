@@ -8,6 +8,7 @@ const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
+const AdmZip = require('adm-zip');
 
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 80,
@@ -57,7 +58,7 @@ app.get('/files', async (req, res) => {
     const fileDetails = await Promise.all(files.map(async (file) => {
       const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
       if (stats.size > 0) {
-        return { name: file, size: stats.size, mime: getMimeType(file) };
+        return { name: file, size: stats.size, mime: 'application/zip' };
       }
       return null;
     }));
@@ -76,7 +77,7 @@ async function loadFileBuffer(fileName) {
     const buffer = await fsp.readFile(filePath);
     const hash = crypto.createHash('sha256').update(buffer).digest('hex');
     FILE_CACHE.set(fileName, { buffer, hash });
-    log(`File loaded bytes=${buffer.length} hash=${hash} from ${filePath} (name=${fileName}, mime=${getMimeType(fileName)})`);
+    log(`File loaded bytes=${buffer.length} hash=${hash} from ${filePath} (name=${fileName}, mime=application/zip)`);
     return { buffer, hash };
   } catch (e) {
     log(`File not found at ${filePath}: ${e.message}`);
@@ -96,7 +97,7 @@ app.get('/files/:fileName', async (req, res) => {
   if (!file) return res.status(404).type('text').send('File not found.');
   res
     .status(200)
-    .setHeader('Content-Type', getMimeType(fileName))
+    .setHeader('Content-Type', 'application/zip')
     .setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
     .send(file.buffer);
 });
@@ -236,6 +237,8 @@ const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 wss.on('headers', (headers, req) => {
   const ip = req.ip || req.socket.remoteAddress;
+  headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
+  headers.push('Sec-WebSocket-Extensions: none');
   log(`HEADERS ws-tunnel from ip=${ip}`, JSON.stringify(headers));
 });
 
@@ -306,9 +309,9 @@ wss.on('connection', (ws, req) => {
       if (!file) {
         return safeSend(ws, { type: 'error', message: `File ${fileName} not found on server.` });
       }
-      transfers.set(m.id, { type: 'download', id: m.id, fileName, size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
+      transfers.set(m.id, { type: 'download', id: m.id, fileName, originalName: m.originalName || fileName.replace(/\.zip$/, ''), size: file.buffer.length, chunks: Math.ceil(file.buffer.length / CONFIG.CHUNK_SIZE), chunkSize: CONFIG.CHUNK_SIZE, hash: file.hash, ready: false });
       try { 
-        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, ip); 
+        await streamFileOverWS(ws, file.buffer, fileName, CONFIG.CHUNK_SIZE, m.id, file.hash, m.originalName || fileName.replace(/\.zip$/, ''), ip); 
       } catch (e) { 
         safeSend(ws, { type: 'error', message: 'File stream failed: ' + (e?.message || e) }); 
         transfers.delete(m.id);
@@ -338,7 +341,7 @@ wss.on('connection', (ws, req) => {
         log(`Invalid upload path: ${filePath} from ip=${ip}`);
         return safeSend(ws, { type: 'error', message: 'Invalid file path.' });
       }
-      transfers.set(m.id, { type: 'upload', id: m.id, fileName, filePath, size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: m.mime || 'application/octet-stream' });
+      transfers.set(m.id, { type: 'upload', id: m.id, fileName, filePath, originalName: m.originalName || fileName.replace(/\.zip$/, ''), size: Number(m.size) || 0, totalChunks: Number(m.totalChunks) || 0, chunks: [], receivedBytes: 0, mime: 'application/zip' });
       safeSend(ws, { type: 'readyForUpload', id: m.id });
       log(`TUNNEL ready for upload id=${m.id} file=${fileName} size=${m.size} from ip=${ip}`);
       return;
@@ -403,12 +406,12 @@ function attachRawSocketLogs(ws, label, ip) {
   s.on('data', (data) => log(`${label} RAW data length=${data.length} content=${data.toString('utf8').slice(0, 200)} from ip=${ip}`));
 }
 
-async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, ip) {
+async function streamFileOverWS(ws, buffer, name, chunkSize, id, hash, originalName, ip) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  log(`Starting stream for ${name} id=${id} size=${size} mime=${getMimeType(name)} chunks=${chunks} hash=${hash} from ip=${ip}`);
-  safeSend(ws, { type: 'fileMeta', id, name, mime: getMimeType(name), size, chunkSize, chunks, hash });
+  log(`Starting stream for ${name} id=${id} size=${size} mime=application/zip chunks=${chunks} hash=${hash} from ip=${ip}`);
+  safeSend(ws, { type: 'fileMeta', id, name, originalName, mime: 'application/zip', size, chunkSize, chunks, hash });
   log(`TUNNEL sent fileMeta from ip=${ip}`);
   const transfer = transfers.get(id);
   if (!transfer) {
@@ -477,7 +480,19 @@ async function handleFileUpload(ws, m, transfer, ip) {
       }
       const buffer = Buffer.concat(transfer.chunks.filter(chunk => chunk));
       const finalHash = crypto.createHash('sha256').update(buffer).digest('hex');
-      await fsp.writeFile(transfer.filePath, buffer);
+      if (finalHash !== m.hash) {
+        log(`TUNNEL upload final hash mismatch id=${transfer.id} expected=${m.hash}, got=${finalHash} from ip=${ip}`);
+        return safeSend(ws, { type: 'error', message: 'Final hash mismatch' });
+      }
+      const zip = new AdmZip(buffer);
+      const entries = zip.getEntries();
+      const entry = entries.find(e => e.entryName === transfer.originalName);
+      if (!entry) {
+        log(`TUNNEL upload failed: file ${transfer.originalName} not found in zip from ip=${ip}`);
+        return safeSend(ws, { type: 'error', message: 'File not found in zip' });
+      }
+      const filePath = path.join(CONFIG.FILES_DIR, transfer.fileName);
+      await fsp.writeFile(filePath, buffer); // Store as zip
       FILE_CACHE.set(transfer.fileName, { buffer, hash: finalHash });
       safeSend(ws, { type: 'uploadComplete', id: transfer.id, fileName: transfer.fileName, size: transfer.receivedBytes, hash: finalHash });
       log(`TUNNEL upload complete id=${transfer.id} file=${transfer.fileName} bytes=${transfer.receivedBytes} hash=${finalHash} from ip=${ip}`);
@@ -513,32 +528,7 @@ function safeSend(ws, obj) {
 }
 
 function getMimeType(fileName) {
-  const ext = path.extname(fileName).toLowerCase();
-  const mimeTypes = {
-    '.exe': 'application/vnd.microsoft.portable-executable',
-    '.sh': 'application/x-sh',
-    '.bat': 'application/x-bat',
-    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    '.doc': 'application/msword',
-    '.xls': 'application/vnd.ms-excel',
-    '.ppt': 'application/vnd.ms-powerpoint',
-    '.odt': 'application/vnd.oasis.opendocument.text',
-    '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
-    '.odp': 'application/vnd.oasis.opendocument.presentation',
-    '.zip': 'application/zip',
-    '.rar': 'application/x-rar-compressed',
-    '.7z': 'application/x-7z-compressed',
-    '.gz': 'application/gzip',
-    '.tar': 'application/x-tar',
-    '.pdf': 'application/pdf',
-    '.txt': 'text/plain',
-    '.jpg': 'image/jpeg',
-    '.png': 'image/png',
-    '.mp3': 'audio/mpeg'
-  };
-  return mimeTypes[ext] || 'application/octet-stream';
+  return 'application/zip'; // All files are zips
 }
 
 function sanitizeFileName(fileName) {
