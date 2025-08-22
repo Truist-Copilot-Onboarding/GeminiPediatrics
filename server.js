@@ -13,7 +13,7 @@ const CONFIG = {
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
   PDF_NAME: process.env.PDF_NAME || 'HelloWorld.exe',
   PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.exe'),
-  CHUNK_SIZE: 1 * 1024, // CHANGE: 1 KiB chunks for file transfer
+  CHUNK_SIZE: 16 * 1024, // CHANGE: Increased to 16 KiB for faster transfer
 };
 
 // Central log bus → broadcasts to SSE clients
@@ -59,7 +59,6 @@ app.get('/HelloWorld.exe', async (_req, res) => {
 
 // Root tester
 app.get('/', (_req, res) => {
-  // CHANGE: Clean, minimal template string to fix syntax error
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -154,11 +153,13 @@ app.get('/', (_req, res) => {
       let ws, sent = new Map(), rtts = [], reconnectAttempts = 0;
       let rx = null;
       function b64ToBytes(b64) {
+        const start = performance.now();
         try {
           const bin = atob(b64); 
           const len = bin.length;
           const out = new Uint8Array(len);
           for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xFF;
+          log('b64ToBytes took ' + (performance.now() - start).toFixed(1) + 'ms'); // CHANGE: Log decoding time
           return out;
         } catch (e) {
           log('b64ToBytes error: ' + e.message);
@@ -172,7 +173,7 @@ app.get('/', (_req, res) => {
       }
       function connect() {
         log('Attempting connection to ' + url + ' (attempt ' + (reconnectAttempts + 1) + ')');
-        ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false }); // CHANGE: Add protocol, disable compression
+        ws = new WebSocket(url, ['tunnel'], { perMessageDeflate: false, headers: { 'Sec-WebSocket-Extensions': 'none' } }); // CHANGE: Force no compression
         ws.onopen = () => { 
           status.innerHTML = '<span class="ok">OPEN</span>'; 
           log('OPEN ' + url); 
@@ -224,6 +225,7 @@ app.get('/', (_req, res) => {
           setTimeout(connect, delay);
         };
         ws.onmessage = (ev) => {
+          const start = performance.now();
           log('MESSAGE received length=' + ev.data.length + ' content=' + ev.data.slice(0, 200));
           let m = null; 
           try { 
@@ -267,7 +269,7 @@ app.get('/', (_req, res) => {
               gotChunks: 0,
               buf: new Uint8Array(Number(m.size) || 0)
             };
-            pdfInfo.textContent = \`Receiving \${rx.name} (\${rx.size} bytes) in \${rx.totalChunks} chunks...\`;
+            pdfInfo.textContent = `Receiving ${rx.name} (${rx.size} bytes) in ${rx.totalChunks} chunks...`;
             pdfProg.max = rx.size || 100;
             log('FILE META ' + JSON.stringify(m));
             try {
@@ -292,7 +294,7 @@ app.get('/', (_req, res) => {
               rx.gotChunks++;
               if (rx.size) pdfProg.value = rx.offset;
               if ((rx.gotChunks % 16) === 0 || rx.gotChunks === rx.totalChunks) {
-                log(\`FILE CHUNK \${rx.gotChunks}/\${rx.totalChunks} (+\${bytes.length}B)\`);
+                log(`FILE CHUNK ${rx.gotChunks}/${rx.totalChunks} (+${bytes.length}B) took ${(performance.now() - start).toFixed(1)}ms`); // CHANGE: Log chunk processing time
               }
             } catch (e) {
               log('FILE CHUNK error: ' + e.message);
@@ -300,7 +302,7 @@ app.get('/', (_req, res) => {
             return;
           }
           if (m.type === 'fileEnd' && rx) {
-            log('FILE END ok=' + (!!m.ok) + ' total=' + rx.offset + ' bytes');
+            log('FILE END ok=' + (!!m.ok) + ' total=' + rx.offset + ' bytes took ' + (performance.now() - start).toFixed(1) + 'ms'); // CHANGE: Log total time
             try {
               const blob = new Blob([rx.buf], { type: rx.mime });
               const a = document.createElement('a');
@@ -574,6 +576,7 @@ function attachTunnelWSS(server) {
 }
 
 async function streamPdfOverWS(ws, buffer, name, chunkSize) {
+  const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
   safeSend(ws, { type: 'fileMeta', name, mime: 'application/vnd.microsoft.portable-executable', size, chunkSize, chunks });
@@ -583,6 +586,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
       log('TUNNEL stream aborted: socket closed');
       throw new Error('socket closed during stream');
     }
+    const chunkStart = performance.now();
     const start = i * chunkSize;
     const end = Math.min(size, start + chunkSize);
     const slice = buffer.subarray(start, end);
@@ -592,16 +596,16 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize) {
         ws.send(JSON.stringify({ type: 'fileChunk', seq: i, data: b64 }), (err) => err ? reject(err) : resolve());
       });
       if ((i % 16) === 0 || i === chunks - 1) {
-        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length}`);
+        log(`TUNNEL sent file chunk ${i + 1}/${chunks} bytes=${slice.length} took ${(performance.now() - chunkStart).toFixed(1)}ms`); // CHANGE: Log chunk time
       }
     } catch (e) {
       log('TUNNEL file chunk error: ' + e.message);
       throw e;
     }
-    await new Promise(resolve => setTimeout(resolve, 500)); // CHANGE: 500ms delay
+    await new Promise(resolve => setTimeout(resolve, 100)); // CHANGE: Reduced to 100ms delay
   }
   safeSend(ws, { type: 'fileEnd', name, ok: true });
-  log('TUNNEL sent fileEnd');
+  log(`TUNNEL sent fileEnd totalTime=${(performance.now() - start).toFixed(1)}ms`);
 }
 
 function attachRawSocketLogs(ws, label) {
