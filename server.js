@@ -195,40 +195,9 @@ app.get('/logs', (req, res) => {
 // HTTP server
 const server = http.createServer(app);
 
-// WebSocket servers
-const wssTunnel = new WebSocketServer({ noServer: true, path: '/ws-tunnel', perMessageDeflate: false, maxPayload: 1024 * 1024 });
-const wssEcho = new WebSocketServer({ noServer: true, path: '/ws-echo', perMessageDeflate: false });
-
-server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
-  if (req.url === '/ws-tunnel') {
-    wssTunnel.handleUpgrade(req, socket, head, (ws) => {
-      wssTunnel.emit('connection', ws, req);
-    });
-  } else if (req.url === '/ws-echo') {
-    wssEcho.handleUpgrade(req, socket, head, (ws) => {
-      wssEcho.emit('connection', ws, req);
-    });
-  } else {
-    log('Invalid upgrade request for ' + req.url);
-    socket.destroy();
-  }
-});
-
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
-server.requestTimeout = 0;
-
-// Tunnel WebSocket
-wssTunnel.on('headers', (headers, req) => {
-  headers = headers.filter(h => !h.toLowerCase().startsWith('sec-websocket-extensions'));
-  headers.push('Keep-Alive: timeout=30');
-  headers.push('Sec-WebSocket-Extensions: none');
-  headers.push('Sec-WebSocket-Protocol: tunnel');
-  log('HEADERS ws-tunnel', JSON.stringify(headers));
-});
-
-wssTunnel.on('connection', (ws, req) => {
+// WebSocket server
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
+wss.on('connection', (ws, req) => {
   const s = ws._socket;
   try { 
     s.setNoDelay(true); 
@@ -382,6 +351,7 @@ wssTunnel.on('connection', (ws, req) => {
 });
 
 // Echo WebSocket
+const wssEcho = new WebSocketServer({ server, path: '/ws-echo', perMessageDeflate: false });
 wssEcho.on('connection', (ws, req) => {
   attachRawSocketLogs(ws, 'ECHO');
   const ip = req.socket.remoteAddress;
