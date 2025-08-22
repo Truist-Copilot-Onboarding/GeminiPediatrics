@@ -1,14 +1,16 @@
 {
-  "name": "ws-tunnel-dual-port",
+  "name": "ws-tunnel",
   "version": "1.0.0",
-  "private": true,
-  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": "20.x", // Match your local node --version
+    "npm": "10.x"   // Match your local npm --version
+  },
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.17.0"
+    "ws": "^8.18.0",
+    "adm-zip": "^0.5.16" // NEW: Added for zip validation
   }
 }
-

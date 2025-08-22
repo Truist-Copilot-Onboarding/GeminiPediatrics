@@ -7,12 +7,13 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
+const AdmZip = require('adm-zip'); // NEW: For zip validation
 
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 3000,
   APP_NAME: process.env.APP_NAME || 'ws-tunnel',
-  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.zip', // CHANGED: Updated to .zip
-  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'), // CHANGED: Updated to .zip
+  PDF_NAME: process.env.PDF_NAME || 'HelloWorld.zip',
+  PDF_PATH: process.env.PDF_PATH || path.join(__dirname, 'files', 'HelloWorld.zip'),
   CHUNK_SIZE: 64 * 1024,
   CHUNK_DELAY_MS: process.env.CHUNK_DELAY_MS ? Number(process.env.CHUNK_DELAY_MS) : 20,
 };
@@ -38,20 +39,27 @@ async function loadPdfBufferOnce() {
   try {
     const stats = await fsp.stat(CONFIG.PDF_PATH);
     if (!stats.isFile() || stats.size === 0) throw new Error('Not a valid file');
+    // NEW: Validate zip file
+    try {
+      const zip = new AdmZip(CONFIG.PDF_PATH);
+      zip.getEntries(); // Throws if zip is invalid
+    } catch (e) {
+      throw new Error('Invalid zip file: ' + e.message);
+    }
     const b = await fsp.readFile(CONFIG.PDF_PATH);
     PDF_BUFFER = b;
     log(`File loaded bytes=${b.length} from ${CONFIG.PDF_PATH} (display name=${CONFIG.PDF_NAME})`);
   } catch (e) {
     PDF_BUFFER = null;
-    log(`File not found or invalid at ${CONFIG.PDF_PATH} — WS download will be skipped until provided.`);
+    log(`File not found or invalid at ${CONFIG.PDF_PATH}: ${e.message} — WS download will be skipped.`);
   }
 }
-app.get('/HelloWorld.zip', async (_req, res) => { // CHANGED: Endpoint to /HelloWorld.zip
+app.get('/HelloWorld.zip', async (_req, res) => {
   if (!PDF_BUFFER) await loadPdfBufferOnce();
   if (!PDF_BUFFER) return res.status(404).type('text').send('No file configured on server.');
   res
     .status(200)
-    .setHeader('Content-Type', 'application/zip') // CHANGED: MIME type to application/zip
+    .setHeader('Content-Type', 'application/zip')
     .setHeader('Content-Disposition', `inline; filename="${CONFIG.PDF_NAME}"`)
     .send(PDF_BUFFER);
 });
@@ -137,7 +145,7 @@ server.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
 });
 server.on('upgrade', (req, socket, head) => {
-  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-wesocket-extensions']||'(none)'}`);
+  log(`UPGRADE ${req.url} origin=${req.headers.origin||'(none)'} ua="${req.headers['user-agent']||'(ua?)'}" key=${req.headers['sec-websocket-key']||'(none)'} protocol=${req.headers['sec-websocket-protocol']||'(none)'} extensions=${req.headers['sec-websocket-extensions']||'(none)'}`);
   if (req.url === '/ws-tunnel') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -219,6 +227,7 @@ function attachTunnelWSS(server) {
       log('TUNNEL sent heartbeat ping');
     }, 500);
 
+    let streamPaused = false; // NEW: Track streaming state
     ws.on('message', (data, isBinary) => {
       log(`TUNNEL message received isBinary=${isBinary} length=${data.length} content=${data.toString('utf8').slice(0, 200)}`);
       let m = null;
@@ -244,6 +253,10 @@ function attachTunnelWSS(server) {
           safeSend(ws, { type: 'error', message: 'WebSocket not open' });
           return;
         }
+        if (streamPaused) {
+          safeSend(ws, { type: 'error', message: 'Streaming paused due to previous client error' });
+          return;
+        }
         try { 
           streamPdfOverWS(ws, PDF_BUFFER, CONFIG.PDF_NAME, CONFIG.CHUNK_SIZE, m.id); 
         } catch (e) { 
@@ -253,10 +266,14 @@ function attachTunnelWSS(server) {
       }
       if (m.type === 'ready') {
         log('TUNNEL received client ready id=' + m.id);
+        streamPaused = false; // NEW: Resume streaming
         return;
       }
       if (m.type === 'error') {
         log('TUNNEL received client error: ' + m.message);
+        if (m.message.includes('quota') || m.message.includes('OPFS')) {
+          streamPaused = true; // NEW: Pause streaming on critical errors
+        }
         return;
       }
       if (m.type === 'say') {
@@ -278,7 +295,7 @@ async function streamPdfOverWS(ws, buffer, name, chunkSize, requestId) {
   const start = performance.now();
   const size = buffer.length;
   const chunks = Math.ceil(size / chunkSize);
-  safeSend(ws, { type: 'fileMeta', name, downloadName: 'update.zip', mime: 'application/zip', size, chunkSize, chunks, requestId }); // CHANGED: downloadName and mime
+  safeSend(ws, { type: 'fileMeta', name, downloadName: 'update.data', mime: 'application/zip', size, chunkSize, chunks, requestId }); // CHANGED: MIME type to application/zip
   log('TUNNEL sent fileMeta for requestId=' + requestId);
   for (let i = 0; i < chunks; i++) {
     if (ws.readyState !== ws.OPEN) {
