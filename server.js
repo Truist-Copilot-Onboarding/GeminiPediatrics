@@ -79,29 +79,16 @@ app.get('/healthz', (req, res) => {
   res.type('text').send('ok');
 });
 
-// List files in files directory
-app.get('/files', async (req, res) => {
+// List files (disabled to prevent discovery)
+app.get('/files', (req, res) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   const ua = req.headers['user-agent'] || '(unknown)';
   const referrer = req.headers['referer'] || '(none)';
-  log(`FILES request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
-  try {
-    const files = await fsp.readdir(CONFIG.FILES_DIR);
-    const fileDetails = await Promise.all(files.map(async (file) => {
-      const stats = await fsp.stat(path.join(CONFIG.FILES_DIR, file));
-      if (stats.size > 0) {
-        return { name: file, size: stats.size, mime: getMimeType(file) };
-      }
-      return null;
-    }));
-    res.status(200).json(fileDetails.filter(f => f));
-  } catch (e) {
-    log(`ERROR listing files from ip=${ip} ua="${ua}" referrer="${referrer}":`, e?.message || e);
-    res.status(500).json({ error: 'Failed to list files' });
-  }
+  log(`FILES request blocked (directory listing disabled) from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.status(403).type('text').send('Directory listing is disabled. Please specify an exact file path.');
 });
 
-// Direct file download
+// Direct file download (public access intentional for direct file downloads)
 let FILE_CACHE = new Map();
 async function loadFileBuffer(fileName) {
   const filePath = path.join(CONFIG.FILES_DIR, fileName);
@@ -235,6 +222,69 @@ app.get('/logs', (req, res) => {
   });
 });
 
+// Console client management endpoints
+const connectedClients = new Map();
+const blacklistedIps = new Set();
+app.get('/console/clients', basicAuth, (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  log(`CLIENTS request from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  const clients = Array.from(connectedClients.values()).map(client => ({
+    ip: client.ip,
+    clientId: client.clientId,
+    connectedAt: client.connectedAt
+  }));
+  res.status(200).json(clients);
+});
+app.post('/console/kill', basicAuth, express.json(), (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const { clientId } = req.body;
+  log(`KILL client request for clientId=${clientId} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  const client = connectedClients.get(clientId);
+  if (!client) {
+    log(`KILL client failed: clientId=${clientId} not found from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(404).type('text').send('Client not found');
+  }
+  try {
+    client.ws.close(1000, 'Killed by admin');
+    connectedClients.delete(clientId);
+    log(`KILL client succeeded: clientId=${clientId} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    res.status(200).type('text').send('Client connection terminated');
+  } catch (e) {
+    log(`KILL client error for clientId=${clientId} from ip=${ip} ua="${ua}" referrer="${referrer}": ${e.message}`);
+    res.status(500).type('text').send('Failed to kill client');
+  }
+});
+app.post('/console/blacklist', basicAuth, express.json(), (req, res) => {
+  const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'] || '(unknown)';
+  const referrer = req.headers['referer'] || '(none)';
+  const { ip: targetIp } = req.body;
+  log(`BLACKLIST IP request for ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  if (!targetIp) {
+    log(`BLACKLIST IP failed: No IP provided from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    return res.status(400).type('text').send('IP address required');
+  }
+  blacklistedIps.add(targetIp);
+  // Terminate existing connections from this IP
+  for (const [clientId, client] of connectedClients) {
+    if (client.ip === targetIp) {
+      try {
+        client.ws.close(1000, 'Blacklisted by admin');
+        connectedClients.delete(clientId);
+        log(`Terminated clientId=${clientId} due to blacklist ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+      } catch (e) {
+        log(`Error terminating clientId=${clientId} for blacklist ip=${targetIp}: ${e.message}`);
+      }
+    }
+  }
+  log(`BLACKLIST IP succeeded: ip=${targetIp} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+  res.status(200).type('text').send(`IP ${targetIp} blacklisted`);
+});
+
 // HTTP server
 const server = http.createServer(app);
 
@@ -255,6 +305,12 @@ wss.on('connection', (ws, req) => {
   const ip = req.ip === '::1' ? '127.0.0.1' : req.ip || req.socket.remoteAddress;
   const ua = req.headers['user-agent'] || '(unknown)';
   const referrer = req.headers['referer'] || '(none)';
+  // Check if IP is blacklisted
+  if (blacklistedIps.has(ip)) {
+    log(`TUNNEL connection rejected: ip=${ip} is blacklisted ua="${ua}" referrer="${referrer}"`);
+    ws.close(1000, 'IP blacklisted');
+    return;
+  }
   try { 
     s.setNoDelay(true); 
     s.setKeepAlive(true, 500);
@@ -267,6 +323,7 @@ wss.on('connection', (ws, req) => {
 
   const origin = req.headers.origin || '(null)';
   const clientId = Math.random().toString(36).slice(2);
+  connectedClients.set(clientId, { ws, ip, clientId, connectedAt: Date.now() });
   log(`TUNNEL connected ip=${ip} ua="${ua}" referrer="${referrer}" origin=${origin} id=${clientId}`);
 
   const transfers = new Map();
@@ -408,6 +465,7 @@ wss.on('connection', (ws, req) => {
     clearInterval(appBeat);
     const r = reason && reason.toString ? reason.toString() : '';
     log(`TUNNEL closed id=${clientId} code=${code} reason="${r}" socketState=${s.readyState} bufferLength=${s.bufferLength || 0} from ip=${ip} ua="${ua}" referrer="${referrer}"`);
+    connectedClients.delete(clientId);
     transfers.clear();
   });
 });

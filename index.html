@@ -295,7 +295,7 @@
         const searchTerm = searchLogs.value.toLowerCase();
         const selectedFilter = logFilter.value;
         const filteredLogs = logLines.filter(line => {
-          const isPing = line.includes('PING');
+          const isPing = line.includes('PING') || line.includes('heartbeat');
           const isPong = line.includes('PONG');
           const isFileTransfer = line.includes('FILE CHUNK') || line.includes('FILE META') || line.includes('FILE END') || 
                                 line.includes('UPLOAD COMPLETE') || line.includes('DELETE COMPLETE') || line.includes('Unzip file error');
